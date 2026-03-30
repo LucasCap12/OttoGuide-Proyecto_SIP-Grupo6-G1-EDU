@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <!--
+    Arquitectura de conectividad auditada (v1.1 — post-auditoria S0):
+    - El proceso Python (orquestador) se ejecuta en la Companion PC (192.168.123.x).
+    - La Companion PC se conecta al segmento LAN del robot via AP externo en modo Wireless Bridge.
+    - El bridge desacopla eventos de roaming/reasociacion 802.11 del plano Ethernet logico.
+    - CycloneDDS se vincula a la interfaz de red por nombre (eth0), sin fijar address,
+      permitiendo que la IP asignada por la topologia del segmento sea resuelta automaticamente.
+    - El peer estatico 192.168.123.161 fuerza unicast asimetrico hacia el bus de locomocion.
+  -->
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="eth0" />
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <Peers>
+        <Peer address="192.168.123.161" />
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
