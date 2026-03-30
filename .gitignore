@@ -1,0 +1,57 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# ===== Entorno virtual =====
+.venv/
+venv/
+env/
+
+# ===== Variables de entorno locales =====
+.env
+.env.local
+.env.*.local
+
+# ===== Testing =====
+.pytest_cache/
+htmlcov/
+.coverage
+*.cover
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== Logs y datos transitorios =====
+logs/
+*.log
+
+# ===== SDK upstream (clonar desde github.com/unitreerobotics/unitree_sdk2_python) =====
+libs/
+
+# ===== Binarios precompilados =====
+*.so
+*.dylib
+*.dll
+*.o
+*.a
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Datos y recursos locales (no versionables) =====
+data/
+resources/
