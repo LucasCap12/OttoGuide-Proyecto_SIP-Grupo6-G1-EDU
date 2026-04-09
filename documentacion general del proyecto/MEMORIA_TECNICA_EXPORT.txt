@@ -1,0 +1,38 @@
+OTTOGUIDE MVP - EXPORT TECNICO ACADEMICO
+UADE 2026
+
+RESUMEN GLOBAL
+Archivos Python analizados: 20
+Lineas totales: 5649
+Lineas de codigo no vacias: 4900
+Lineas en blanco: 749
+
+ESTADOS FSM DETECTADOS
+- emergency
+- idle
+- interacting
+- navigating
+
+DETALLE POR ARCHIVO
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\hardware\__init__.py | total=15 | codigo=13 | blanco=2
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\hardware\interface.py | total=109 | codigo=95 | blanco=14
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\hardware\mock_adapter.py | total=144 | codigo=125 | blanco=19
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\hardware\real_adapter.py | total=246 | codigo=216 | blanco=30
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\hardware\sim_adapter.py | total=268 | codigo=238 | blanco=30
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\__init__.py | total=8 | codigo=8 | blanco=0
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\api\__init__.py | total=47 | codigo=39 | blanco=8
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\api\api_server.py | total=245 | codigo=215 | blanco=30
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\api\server.py | total=657 | codigo=569 | blanco=88
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\core\__init__.py | total=3 | codigo=2 | blanco=1
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\core\tour_orchestrator.py | total=716 | codigo=620 | blanco=96
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\hardware\__init__.py | total=13 | codigo=12 | blanco=1
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\hardware\robot_hardware_api.py | total=278 | codigo=240 | blanco=38
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\interaction\__init__.py | total=17 | codigo=16 | blanco=1
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\interaction\conversation_manager.py | total=1070 | codigo=939 | blanco=131
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\navigation\__init__.py | total=35 | codigo=27 | blanco=8
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\navigation\nav2_bridge.py | total=759 | codigo=646 | blanco=113
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\navigation\navigation_manager.py | total=307 | codigo=274 | blanco=33
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\vision\__init__.py | total=8 | codigo=7 | blanco=1
+C:\Users\lucas\Documents\OttoGuide-Proyecto_SIP-Grupo6-UADE\src\vision\vision_processor.py | total=704 | codigo=599 | blanco=105
+
+FIN DEL REPORTE

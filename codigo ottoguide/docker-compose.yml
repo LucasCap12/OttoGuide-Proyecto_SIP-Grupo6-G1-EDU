@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  ottoguide:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ottoguide:latest
+    network_mode: "host"
+    environment:
+      ROBOT_MODE: ${ROBOT_MODE:-mock}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://127.0.0.1:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+    stop_grace_period: 3s
+    restart: unless-stopped
+    command: ["python", "main.py"]

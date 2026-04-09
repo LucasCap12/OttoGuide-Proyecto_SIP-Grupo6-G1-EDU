@@ -1,62 +1,48 @@
 # ===== Python =====
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyc
+*.so
 *.pyd
-*.egg-info/
-*.egg
-dist/
+
+# ===== Build =====
 build/
-*.whl
-
-# ===== Entorno virtual =====
-.venv/
-venv/
-env/
-
-# ===== Variables de entorno locales =====
-.env
-.env.local
-.env.*.local
+dist/
+*.egg-info/
 
 # ===== Testing =====
 .pytest_cache/
-htmlcov/
 .coverage
-*.cover
+coverage.xml
+htmlcov/
+
+# ===== Variables de entorno =====
+.env
+.venv/
+env/
+venv/
+
+# ===== OS =====
+.DS_Store
 
 # ===== IDE =====
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
 
-# ===== Logs y datos transitorios =====
-logs/
+# ===== Logs =====
 *.log
+logs/
 
-# ===== SDK upstream (clonar desde github.com/unitreerobotics/unitree_sdk2_python) =====
+# ===== Mapas SLAM generados localmente =====
+maps/*.pgm
+maps/*.yaml
+
+# ===== Simulador MuJoCo (clonar externamente, no incluir en repo) =====
+unitree_mujoco/
+
+# ===== SDK upstream (instalar via pip, no local) =====
 libs/
+codigo ottoguide/libs/
 
-# ===== Binarios precompilados =====
-*.so
-*.dylib
-*.dll
-*.o
-*.a
-
-# ===== OS =====
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# ===== Documentacion web y PDFs (no versionables) =====
-*.pdf
-*.mhtml
-*.html
-
-# ===== Datos y recursos locales (no versionables) =====
+# ===== Datos y recursos locales =====
 data/
 resources/
