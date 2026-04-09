@@ -15,8 +15,9 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from statemachine.exceptions import TransitionNotAllowed
+from src.api.websocket_manager import TelemetryManager
 
 from .schemas import (
     EmergencyRequest,
@@ -33,6 +34,7 @@ from .schemas import (
 LOGGER = logging.getLogger("otto_guide.api.router")
 
 router = APIRouter()
+telemetry_manager = TelemetryManager()
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +194,56 @@ async def endpoint_emergency(
     }
 
 
+@router.post(
+    "/api/emergency_stop",
+    status_code=status.HTTP_200_OK,
+    summary="Kill switch de emergencia para detener la FSM inmediatamente",
+)
+async def endpoint_emergency_stop(
+    orchestrator=Depends(_get_orchestrator),
+) -> dict:
+    nav_bridge = getattr(orchestrator, "_nav_bridge", None)
+    if nav_bridge is not None:
+        try:
+            await asyncio.wait_for(nav_bridge.cancel_navigation(), timeout=1.0)
+        except Exception as exc:
+            LOGGER.error("[API] cancel_navigation previo a kill switch fallo: %s", exc)
+
+    try:
+        await asyncio.wait_for(orchestrator.emergency_stop(reason="api_kill_switch"), timeout=5.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Timeout activando emergency_stop",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error activando emergency_stop: {exc}",
+        )
+
+    return {"status": "emergency_engaged"}
+
+
+@router.websocket("/ws/telemetry")
+async def websocket_telemetry(
+    websocket: WebSocket,
+) -> None:
+    await telemetry_manager.connect(websocket)
+    try:
+        orchestrator = getattr(websocket.app.state, "orchestrator", None)
+        if orchestrator is not None and hasattr(orchestrator, "build_telemetry_payload"):
+            payload = await orchestrator.build_telemetry_payload()
+            await websocket.send_json(payload)
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await telemetry_manager.disconnect(websocket)
+    except Exception:
+        await telemetry_manager.disconnect(websocket)
+        raise
+
+
 @router.get(
     "/status",
     response_model=StatusResponse,
@@ -317,7 +369,7 @@ async def endpoint_reload_script(
     """
     @TASK: Forzar recarga del guion de tour desde data/mvp_tour_script.json
     @INPUT: Sin payload
-    @OUTPUT: ScriptReloadResponse con version y cantidad de zonas cargadas
+    @OUTPUT: ScriptReloadResponse con version y cantidad de waypoints cargados
     @CONTEXT: Permite actualizacion de contenido en caliente sin reiniciar el proceso
     STEP 1: Verificar existencia del archivo en la ruta default
     STEP 2: Invocar load_script_from_file() de forma asincrona en executor
@@ -348,16 +400,16 @@ async def endpoint_reload_script(
     # STEP 3
     script = cm.loaded_script
     LOGGER.info(
-        "[API] POST /content/script/reload exitoso. version='%s' zonas=%d",
+        "[API] POST /content/script/reload exitoso. version='%s' waypoints=%d",
         script.version,
-        len(script.zones),
+        len(script.waypoints),
     )
     return ScriptReloadResponse(
         reloaded=True,
         version=script.version,
-        zones_loaded=len(script.zones),
-        detail=f"Guion version '{script.version}' cargado con {len(script.zones)} zona(s).",
+        waypoints_loaded=len(script.waypoints),
+        detail=f"Guion version '{script.version}' cargado con {len(script.waypoints)} waypoint(s).",
     )
 
 
-__all__ = ["router"]
+__all__ = ["router", "telemetry_manager"]

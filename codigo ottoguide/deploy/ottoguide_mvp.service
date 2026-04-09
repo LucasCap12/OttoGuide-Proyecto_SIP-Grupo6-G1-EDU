@@ -1,0 +1,25 @@
+[Unit]
+# @TASK: Definir servicio systemd persistente para el MVP OttoGuide.
+# @INPUT: Orquestador maestro y workspace desplegado en la Companion PC.
+# @OUTPUT: Servicio con reinicio automatico y dependencia de red.
+# @CONTEXT: Automatizacion del arranque al encender el robot.
+# @SECURITY: Reinicio on-failure y ejecucion como usuario no privilegiado.
+Description=OttoGuide MVP End-to-End Service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+Group=unitree
+WorkingDirectory=/home/unitree/ottoguide/codigo_ottoguide
+Environment=ROBOT_MODE=real
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash /home/unitree/ottoguide/codigo_ottoguide/scripts/mvp_master_run.sh
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

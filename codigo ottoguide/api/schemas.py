@@ -9,7 +9,7 @@ from __future__ import annotations
 # STEP 2: Contratos de contenido — ZoneContent y TourScript (nuevos)
 # STEP 3: Contratos de recarga de script (nuevos)
 
-from typing import Any, Optional
+from typing import Optional, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -81,7 +81,7 @@ class QuestionResponse(BaseModel):
 # Contratos de Contenido de Tour (TAREA 1)
 # ---------------------------------------------------------------------------
 
-class ZoneContent(BaseModel):
+class WaypointContent(BaseModel):
     """
     @TASK: Definir contenido de una zona del tour universitario
     @INPUT: JSON editado por el equipo de contenido
@@ -92,21 +92,24 @@ class ZoneContent(BaseModel):
     """
     model_config = ConfigDict(extra="ignore")
 
-    zone_id: str = Field(
+    waypoint_id: str = Field(
         min_length=1,
-        description="Identificador unico de la zona (e.g. 'entrada', 'planta_baja', 'patio').",
+        description="Identificador logico del waypoint (I, 1, 2, 3, F).",
     )
-    system_prompt: str = Field(
-        min_length=1,
-        description="Contexto de sistema prepend al prompt del usuario antes de enviarlo a Ollama.",
+    interaction_type: Literal["scripted", "llm_qa"] = Field(
+        description="Tipo de interaccion para el waypoint.",
     )
-    trigger_waypoints: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="Lista de coordenadas {x, y, yaw_rad} que activan esta zona. Opcional.",
+    script_text: Optional[str] = Field(
+        default=None,
+        description="Texto determinista para TTS offline cuando interaction_type='scripted'.",
     )
-    allowed_intents: list[str] = Field(
-        default_factory=list,
-        description="Intenciones de usuario permitidas en esta zona (e.g. 'pregunta', 'repetir').",
+    system_prompt: Optional[str] = Field(
+        default=None,
+        description="Prompt base para LLM cuando interaction_type='llm_qa'.",
+    )
+    pose_2d: dict[str, float] = Field(
+        min_length=3,
+        description="Coordenadas 2D del mapa para navegacion fisica: {x, y, theta}.",
     )
 
 
@@ -124,9 +127,9 @@ class TourScript(BaseModel):
         min_length=1,
         description="Version semantica del guion (e.g. '1.0.0'). Usada para auditorias.",
     )
-    zones: list[ZoneContent] = Field(
+    waypoints: list[WaypointContent] = Field(
         min_length=1,
-        description="Lista de zonas en orden de aparicion en el tour. Minimo 1 zona.",
+        description="Lista ordenada de waypoints logicos del tour. Minimo 1.",
     )
 
 
@@ -140,7 +143,7 @@ class ScriptReloadResponse(BaseModel):
     """
     reloaded: bool
     version: str
-    zones_loaded: int
+    waypoints_loaded: int
     detail: str
 
 
@@ -155,5 +158,5 @@ __all__ = [
     "StartTourResponse",
     "StatusResponse",
     "TourScript",
-    "ZoneContent",
+    "WaypointContent",
 ]

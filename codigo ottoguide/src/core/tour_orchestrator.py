@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -23,6 +25,8 @@ from statemachine import State, StateMachine
 from statemachine.engines.async_ import AsyncEngine
 
 from src.hardware import RobotHardwareAPI, RobotHardwareAPIError
+from src.api.websocket_manager import TelemetryManager
+from src.core.mission_audit import MissionAuditLogger
 from src.interaction import ConversationManager, ConversationRequest, ConversationResponse
 from src.navigation import AsyncNav2Bridge, NavWaypoint
 from src.vision import OdometryVector, VisionProcessor
@@ -49,6 +53,7 @@ WAYPOINT_POLL_INTERVAL_S: float = 0.1
 NAV_TASK_SETTLE_S: float = 0.05   # pausa tras cancel de tarea background
 
 LOGGER = logging.getLogger(__name__)
+ROBOT_MODE_REAL: str = "real"
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +160,8 @@ class TourOrchestrator(StateMachine):
         nav_bridge: AsyncNav2Bridge,
         conversation_manager: ConversationManager,
         vision_processor: VisionProcessor,
+        telemetry_manager: Optional[TelemetryManager] = None,
+        mission_audit_logger: Optional[MissionAuditLogger] = None,
         damp_timeout_s: float = DAMP_TIMEOUT_S,
         audio_capture_timeout_s: float = AUDIO_CAPTURE_TIMEOUT_S,
     ) -> None:
@@ -181,6 +188,8 @@ class TourOrchestrator(StateMachine):
         self._nav_bridge: AsyncNav2Bridge = nav_bridge
         self._conversation_manager: ConversationManager = conversation_manager
         self._vision_processor: VisionProcessor = vision_processor
+        self._telemetry_manager: Optional[TelemetryManager] = telemetry_manager
+        self._mission_audit_logger: Optional[MissionAuditLogger] = mission_audit_logger
         self._damp_timeout_s: float = damp_timeout_s
         self._audio_capture_timeout_s: float = audio_capture_timeout_s
 
@@ -256,6 +265,15 @@ class TourOrchestrator(StateMachine):
         self._context.current_waypoint_index = 0
         self._context.tour_id = plan.tour_id
         self._context.last_error = None
+
+        self._schedule_audit_event(
+            event_type="TOUR_START",
+            node_id=self._resolve_logical_waypoint_id_by_index(0),
+            payload={
+                "tour_id": plan.tour_id,
+                "waypoints_total": len(plan.waypoints),
+            },
+        )
 
         # STEP 3
         await self.start_tour()
@@ -338,6 +356,10 @@ class TourOrchestrator(StateMachine):
                 name="odometry-injection-loop",
             )
             LOGGER.info("[Orchestrator] on_enter_navigating: Tarea de odometria iniciada.")
+        self._schedule_telemetry_broadcast()
+
+    async def on_enter_idle(self) -> None:
+        self._schedule_telemetry_broadcast()
 
     async def on_exit_navigating(self) -> None:
         # @TASK: Cancelar la tarea de inyeccion de odometria al salir de NAVIGATING
@@ -379,7 +401,9 @@ class TourOrchestrator(StateMachine):
             self, "_pending_audio", np.zeros(1, dtype=np.float32)
         )
         language: str = getattr(self, "_pending_language", "es")
+        waypoint_id = self._resolve_logical_waypoint_id()
 
+        self._schedule_telemetry_broadcast()
         LOGGER.info("[Orchestrator] on_enter_interacting: Iniciando secuencia de dialogo.")
 
         # STEP 1: Cancelar navegacion activa
@@ -395,15 +419,23 @@ class TourOrchestrator(StateMachine):
         except Exception as exc:
             LOGGER.warning("[Orchestrator] Fallo al enviar velocidad cero: %s", exc)
 
-        # STEP 3: Procesar audio via ConversationManager con hot-swap local/cloud
+        # STEP 3: Resolver tipo de interaccion por waypoint y ejecutar pipeline correspondiente
         try:
-            response = await asyncio.wait_for(
-                self._conversation_manager.process_interaction(
-                    audio_buffer,
-                    language=language,
-                ),
-                timeout=self._audio_capture_timeout_s,
-            )
+            interaction_type = self._conversation_manager.get_waypoint_interaction_type(waypoint_id)
+            self._conversation_manager.set_active_zone(waypoint_id)
+            if interaction_type == "scripted":
+                response = await asyncio.wait_for(
+                    self._conversation_manager.process_scripted_interaction(waypoint_id),
+                    timeout=self._audio_capture_timeout_s,
+                )
+            else:
+                response = await asyncio.wait_for(
+                    self._conversation_manager.process_interaction(
+                        audio_buffer,
+                        language=language,
+                    ),
+                    timeout=self._audio_capture_timeout_s,
+                )
         except (TimeoutError, asyncio.TimeoutError):
             LOGGER.error(
                 "[Orchestrator] Timeout de proceso de interaccion (%.1f s). "
@@ -429,6 +461,14 @@ class TourOrchestrator(StateMachine):
 
         # STEP 4: Registrar en contexto
         self._context.last_interaction = response
+        self._schedule_audit_event(
+            event_type="INTERACTION_COMPLETED",
+            node_id=waypoint_id,
+            payload={
+                "source_pipeline": response.source_pipeline,
+                "audio_stream_ready": response.audio_stream_ready,
+            },
+        )
         LOGGER.info(
             "[Orchestrator] Dialogo completado. pipeline=%s swap_count=%s",
             response.source_pipeline,
@@ -462,6 +502,15 @@ class TourOrchestrator(StateMachine):
         LOGGER.critical(
             "[Orchestrator] EMERGENCY activado. Causa: %s",
             self._context.last_error,
+        )
+        self._schedule_telemetry_broadcast()
+        self._schedule_audit_event(
+            event_type="EMERGENCY_TRIGGERED",
+            node_id=self._resolve_logical_waypoint_id(),
+            payload={
+                "reason": self._context.last_error or "unknown",
+                "state": self.state_id,
+            },
         )
 
         # STEP 1: Cancelar tareas background
@@ -552,15 +601,24 @@ class TourOrchestrator(StateMachine):
             for idx, waypoint in enumerate(plan):
                 # STEP 3
                 self._context.current_waypoint_index = idx
+                logical_waypoint_id = self._resolve_logical_waypoint_id_by_index(idx)
+                nav_target = self._resolve_navigation_target(
+                    logical_waypoint_id=logical_waypoint_id,
+                    fallback_waypoint=waypoint,
+                )
                 LOGGER.info(
                     "[Orchestrator] Navegando a waypoint %d/%d (x=%.2f y=%.2f yaw=%.2f).",
                     idx + 1, len(plan),
-                    waypoint.x, waypoint.y, waypoint.yaw_rad,
+                    nav_target.x, nav_target.y, nav_target.yaw_rad,
                 )
 
                 # STEP 2: Enviar waypoint individual como lista unitaria
                 try:
-                    success = await self._nav_bridge.navigate_to_waypoints([waypoint])
+                    robot_mode = os.environ.get("ROBOT_MODE", "").strip().lower()
+                    if robot_mode == ROBOT_MODE_REAL and hasattr(self._nav_bridge, "send_goal"):
+                        success = await self._nav_bridge.send_goal(nav_target)
+                    else:
+                        success = await self._nav_bridge.navigate_to_waypoints([nav_target])
                 except asyncio.CancelledError:
                     # STEP 5: Propagacion de cancelacion desde on_exit_navigating o EMERGENCY
                     LOGGER.info(
@@ -577,6 +635,16 @@ class TourOrchestrator(StateMachine):
                     LOGGER.warning(
                         "[Orchestrator] Waypoint %d no completado. Nav2 result=FAILED.", idx
                     )
+                else:
+                    self._schedule_audit_event(
+                        event_type="NODE_REACHED",
+                        node_id=logical_waypoint_id,
+                        payload={
+                            "x": nav_target.x,
+                            "y": nav_target.y,
+                            "yaw_rad": nav_target.yaw_rad,
+                        },
+                    )
 
                 # Ceder al event loop entre waypoints para procesabilidad de señales
                 await asyncio.sleep(WAYPOINT_POLL_INTERVAL_S)
@@ -585,6 +653,14 @@ class TourOrchestrator(StateMachine):
             LOGGER.info("[Orchestrator] Plan de navegacion completado.")
             if self.state_id == "navigating":
                 await self.finish_tour()
+            self._schedule_audit_event(
+                event_type="TOUR_END",
+                node_id=self._resolve_logical_waypoint_id_by_index(len(plan) - 1),
+                payload={
+                    "tour_id": self._context.tour_id,
+                    "waypoints_total": len(plan),
+                },
+            )
 
         except asyncio.CancelledError:
             LOGGER.info("[Orchestrator] _navigation_loop terminado por cancelacion.")
@@ -685,6 +761,41 @@ class TourOrchestrator(StateMachine):
                 pass  # STEP 2
         self._odometry_task = None  # STEP 3
 
+    def _resolve_logical_waypoint_id(self) -> str:
+        index = self._context.current_waypoint_index
+        return self._resolve_logical_waypoint_id_by_index(index)
+
+    def _resolve_logical_waypoint_id_by_index(self, index: int) -> str:
+        logical_ids = ["I", "1", "2", "3", "F"]
+        if index < 0:
+            return "I"
+        if index >= len(logical_ids):
+            return "F"
+        return logical_ids[index]
+
+    def _resolve_navigation_target(
+        self,
+        *,
+        logical_waypoint_id: str,
+        fallback_waypoint: NavWaypoint,
+    ) -> NavWaypoint:
+        robot_mode = os.environ.get("ROBOT_MODE", "").strip().lower()
+        if robot_mode != ROBOT_MODE_REAL:
+            return fallback_waypoint
+        pose_getter = getattr(self._conversation_manager, "get_waypoint_pose_2d", None)
+        if not callable(pose_getter):
+            return fallback_waypoint
+        pose = pose_getter(logical_waypoint_id)
+        if pose is None:
+            return fallback_waypoint
+        x, y, theta = pose
+        return NavWaypoint(
+            x=x,
+            y=y,
+            yaw_rad=theta,
+            frame_id=fallback_waypoint.frame_id,
+        )
+
     # ------------------------------------------------------------------
     # Compatibilidad con TourOrchestrator anterior (respond via ConversationManager)
     # ------------------------------------------------------------------
@@ -703,6 +814,76 @@ class TourOrchestrator(StateMachine):
         response = await self._conversation_manager.respond(request)
         self._context.last_interaction = response                # STEP 2
         return response
+
+    async def build_telemetry_payload(self) -> dict[str, Any]:
+        battery_level = await self._read_battery_level()
+        if self._context.waypoint_plan:
+            waypoint_id = self._resolve_logical_waypoint_id()
+        else:
+            waypoint_id = "N/A"
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "fsm_state": self.state_id.upper(),
+            "current_waypoint_id": waypoint_id,
+            "battery_level": battery_level,
+        }
+
+    def _schedule_telemetry_broadcast(self) -> None:
+        if self._telemetry_manager is None:
+            return
+        task = asyncio.create_task(
+            self._broadcast_telemetry_state(),
+            name=f"telemetry-broadcast-{self.state_id}",
+        )
+        task.add_done_callback(self._handle_telemetry_result)
+
+    async def _broadcast_telemetry_state(self) -> None:
+        if self._telemetry_manager is None:
+            return
+        payload = await self.build_telemetry_payload()
+        await self._telemetry_manager.broadcast(payload)
+
+    async def _read_battery_level(self) -> Any:
+        state_reader = getattr(self._hardware_api, "get_state", None)
+        if callable(state_reader):
+            try:
+                state = await asyncio.wait_for(state_reader(), timeout=0.2)
+                if isinstance(state, dict):
+                    for key in ("battery_level", "battery", "soc", "battery_soc"):
+                        if key in state:
+                            return state[key]
+            except Exception:
+                return 100.0
+        return 100.0
+
+    @staticmethod
+    def _handle_telemetry_result(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except Exception as exc:
+            LOGGER.warning("[Orchestrator] Telemetria no enviada: %s", exc)
+
+    def _schedule_audit_event(
+        self,
+        *,
+        event_type: str,
+        node_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if self._mission_audit_logger is None:
+            return
+        task = asyncio.create_task(
+            self._mission_audit_logger.log_event(event_type, node_id, payload),
+            name=f"audit-{event_type.lower()}",
+        )
+        task.add_done_callback(self._handle_audit_result)
+
+    @staticmethod
+    def _handle_audit_result(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except Exception as exc:
+            LOGGER.warning("[Orchestrator] Auditoria no persistida: %s", exc)
 
 
 # ---------------------------------------------------------------------------

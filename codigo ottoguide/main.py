@@ -17,17 +17,24 @@ import contextlib
 import logging
 import signal
 import sys
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
-from api.router import router
+from api.router import router, telemetry_manager
 from config.settings import get_hardware_adapter, get_settings
 from hardware.interface import RobotHardwareInterface
+from src.core.mission_audit import MissionAuditLogger
 
 LOGGER = logging.getLogger("otto_guide.main")
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+DASHBOARD_FILE = STATIC_DIR / "dashboard.html"
+MISSION_AUDIT_LOGGER = MissionAuditLogger()
 
 # ---------------------------------------------------------------------------
 # Constantes de seguridad
@@ -77,6 +84,8 @@ async def lifespan(app: FastAPI):
             nav_bridge=_get_nav_bridge_stub(),
             conversation_manager=_get_conversation_manager_stub(settings),
             vision_processor=_get_vision_processor_stub(),
+            telemetry_manager=telemetry_manager,
+            mission_audit_logger=MISSION_AUDIT_LOGGER,
         )
         app.state.orchestrator = orchestrator
         LOGGER.info(
@@ -237,7 +246,20 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    if STATIC_DIR.exists():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
     app.include_router(router)
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/dashboard", include_in_schema=False)
+    async def dashboard() -> FileResponse:
+        if not DASHBOARD_FILE.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Dashboard no encontrado en {DASHBOARD_FILE}",
+            )
+        return FileResponse(DASHBOARD_FILE)
 
     return app
 
@@ -271,7 +293,7 @@ if __name__ == "__main__":
     with contextlib.suppress(KeyboardInterrupt):
         uvicorn.run(
             "main:create_app",
-            host=settings.API_HOST,
+            host="0.0.0.0",
             port=settings.API_PORT,
             factory=True,
             log_level="info",

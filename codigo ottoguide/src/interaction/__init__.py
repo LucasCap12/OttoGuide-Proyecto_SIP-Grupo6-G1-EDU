@@ -1,3 +1,4 @@
+from .audio_bridge import AudioHardwareBridge
 from .conversation_manager import (
     CloudNLPPipeline,
     ConversationManager,
@@ -6,12 +7,15 @@ from .conversation_manager import (
     LocalNLPPipeline,
     NLPStrategy,
 )
+from .llm_client import OllamaAsyncClient
 
 __all__ = [
+    "AudioHardwareBridge",
     "CloudNLPPipeline",
     "ConversationManager",
     "ConversationRequest",
     "ConversationResponse",
     "LocalNLPPipeline",
     "NLPStrategy",
+    "OllamaAsyncClient",
 ]

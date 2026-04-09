@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OttoGuide Control Room</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #111826;
+      --panel-2: #162132;
+      --text: #edf2f7;
+      --muted: #98a2b3;
+      --accent: #22c55e;
+      --warn: #f97316;
+      --danger: #ef4444;
+      --border: rgba(148, 163, 184, 0.22);
+      --shadow: 0 22px 45px rgba(0, 0, 0, 0.38);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(34, 197, 94, 0.16), transparent 30%),
+        radial-gradient(circle at top right, rgba(239, 68, 68, 0.14), transparent 22%),
+        linear-gradient(180deg, #0b0f14 0%, #080b10 100%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 100vh;
+      padding: 24px;
+      gap: 20px;
+    }
+
+    .header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 20px 24px;
+      background: rgba(17, 24, 38, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .title {
+      margin: 0;
+      font-size: clamp(1.4rem, 3vw, 2.3rem);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .subtitle {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(34, 197, 94, 0.12);
+      border: 1px solid rgba(34, 197, 94, 0.35);
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 20px;
+      align-items: stretch;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(17, 24, 38, 0.96), rgba(12, 18, 29, 0.95));
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .panel h2 {
+      margin: 0;
+      font-size: 1.1rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .metric {
+      padding: 18px;
+      background: rgba(22, 33, 50, 0.92);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      min-height: 108px;
+    }
+
+    .metric-label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.11em;
+      margin-bottom: 12px;
+    }
+
+    .metric-value {
+      font-size: clamp(1.2rem, 2.2vw, 2rem);
+      font-weight: 800;
+      word-break: break-word;
+    }
+
+    .metric-value.ok {
+      color: var(--accent);
+    }
+
+    .metric-value.warn {
+      color: var(--warn);
+    }
+
+    .metric-value.danger {
+      color: var(--danger);
+    }
+
+    .control-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      height: 100%;
+    }
+
+    .emergency-btn {
+      border: none;
+      border-radius: 20px;
+      padding: 22px 24px;
+      font-size: 1.1rem;
+      font-weight: 900;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      background: linear-gradient(180deg, #ff5f57, #c81e1e);
+      color: white;
+      cursor: pointer;
+      min-height: 92px;
+      box-shadow: 0 16px 32px rgba(239, 68, 68, 0.3);
+      transition: transform 120ms ease, filter 120ms ease, box-shadow 120ms ease;
+    }
+
+    .emergency-btn:hover {
+      transform: translateY(-2px);
+      filter: brightness(1.05);
+      box-shadow: 0 20px 40px rgba(239, 68, 68, 0.38);
+    }
+
+    .emergency-btn:active {
+      transform: translateY(0);
+    }
+
+    .emergency-active {
+      animation: flashDanger 0.55s infinite alternate;
+    }
+
+    @keyframes flashDanger {
+      from {
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.35), 0 16px 32px rgba(239, 68, 68, 0.3);
+      }
+      to {
+        box-shadow: 0 0 0 14px rgba(239, 68, 68, 0.08), 0 24px 52px rgba(239, 68, 68, 0.55);
+      }
+    }
+
+    .log {
+      margin: 0;
+      min-height: 150px;
+      padding: 16px;
+      border-radius: 18px;
+      background: rgba(8, 12, 18, 0.7);
+      border: 1px solid var(--border);
+      color: #dbe4ee;
+      overflow: auto;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+
+    .footer-note {
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
+    .connection {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--danger);
+      box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4);
+    }
+
+    .dot.online {
+      background: var(--accent);
+      box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.08);
+    }
+
+    @media (max-width: 960px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .shell {
+        padding: 14px;
+      }
+
+      .telemetry-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .header {
+        padding: 18px;
+      }
+
+      .panel {
+        padding: 18px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="header">
+      <div>
+        <h1 class="title">OttoGuide Control Room</h1>
+        <p class="subtitle">Dashboard operativo para telemetría y parada de emergencia.</p>
+      </div>
+      <div class="status-pill connection">
+        <span id="connectionDot" class="dot"></span>
+        <span id="connectionText">Desconectado</span>
+      </div>
+    </header>
+
+    <section class="layout">
+      <article class="panel">
+        <h2>Telemetría</h2>
+        <div class="telemetry-grid">
+          <div class="metric">
+            <span class="metric-label">Estado FSM</span>
+            <div id="fsmState" class="metric-value warn">UNKNOWN</div>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Waypoint Actual</span>
+            <div id="currentWaypoint" class="metric-value">N/A</div>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Nivel de Batería</span>
+            <div id="batteryLevel" class="metric-value">N/A</div>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Timestamp</span>
+            <div id="timestamp" class="metric-value">N/A</div>
+          </div>
+        </div>
+        <pre id="telemetryLog" class="log">Esperando telemetría...</pre>
+      </article>
+
+      <aside class="panel control-wrap">
+        <h2>Control</h2>
+        <button id="emergencyBtn" class="emergency-btn">EMERGENCY STOP</button>
+        <div class="footer-note">
+          La acción envía `POST /api/emergency_stop` y fuerza la transición inmediata a EMERGENCY.
+        </div>
+        <pre id="controlLog" class="log">Sin acciones ejecutadas.</pre>
+      </aside>
+    </section>
+  </main>
+
+  <script>
+    const telemetryLog = document.getElementById("telemetryLog");
+    const controlLog = document.getElementById("controlLog");
+    const fsmState = document.getElementById("fsmState");
+    const currentWaypoint = document.getElementById("currentWaypoint");
+    const batteryLevel = document.getElementById("batteryLevel");
+    const timestamp = document.getElementById("timestamp");
+    const emergencyBtn = document.getElementById("emergencyBtn");
+    const connectionDot = document.getElementById("connectionDot");
+    const connectionText = document.getElementById("connectionText");
+
+    let socket = null;
+    let reconnectTimer = null;
+    let reconnectDelay = 1000;
+    let emergencyEngaged = false;
+
+    function appendLog(target, message) {
+      const current = target.textContent.trim();
+      target.textContent = current && current !== "Sin acciones ejecutadas." ? `${current}\n${message}` : message;
+      target.scrollTop = target.scrollHeight;
+    }
+
+    function setConnectionState(online) {
+      connectionDot.classList.toggle("online", online);
+      connectionText.textContent = online ? "Conectado" : "Reconectando";
+    }
+
+    function updateMetric(element, value, tone) {
+      element.textContent = value;
+      element.classList.remove("ok", "warn", "danger");
+      if (tone) {
+        element.classList.add(tone);
+      }
+    }
+
+    function connectTelemetry() {
+      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+      const wsUrl = `${scheme}://${window.location.host}/ws/telemetry`;
+      socket = new WebSocket(wsUrl);
+
+      socket.onopen = () => {
+        reconnectDelay = 1000;
+        setConnectionState(true);
+        appendLog(telemetryLog, `[socket] conectado a ${wsUrl}`);
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          updateMetric(fsmState, String(data.fsm_state ?? "UNKNOWN"), "ok");
+          updateMetric(currentWaypoint, String(data.current_waypoint_id ?? "N/A"), "warn");
+          updateMetric(batteryLevel, `${String(data.battery_level ?? "N/A")} %`, "ok");
+          updateMetric(timestamp, String(data.timestamp ?? "N/A"), "warn");
+          appendLog(telemetryLog, JSON.stringify(data, null, 2));
+        } catch (error) {
+          appendLog(telemetryLog, `[error] telemetría inválida: ${error.message}`);
+        }
+      };
+
+      socket.onclose = () => {
+        setConnectionState(false);
+        appendLog(telemetryLog, "[socket] conexión cerrada; reintentando...");
+        scheduleReconnect();
+      };
+
+      socket.onerror = () => {
+        try {
+          socket.close();
+        } catch (error) {
+          appendLog(telemetryLog, `[socket] error al cerrar: ${error.message}`);
+        }
+      };
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) {
+        return;
+      }
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        reconnectDelay = Math.min(reconnectDelay * 1.7, 10000);
+        connectTelemetry();
+      }, reconnectDelay);
+    }
+
+    async function triggerEmergencyStop() {
+      emergencyBtn.disabled = true;
+      emergencyBtn.classList.add("emergency-active");
+      appendLog(controlLog, "[control] enviando POST /api/emergency_stop...");
+
+      try {
+        const response = await fetch("/api/emergency_stop", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({})
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const payload = await response.json();
+        emergencyEngaged = payload.status === "emergency_engaged";
+        document.body.style.background = "linear-gradient(180deg, #2a0606 0%, #0b0f14 100%)";
+        appendLog(controlLog, `[control] respuesta: ${JSON.stringify(payload)}`);
+        appendLog(controlLog, "[control] parada de emergencia activada.");
+      } catch (error) {
+        emergencyEngaged = false;
+        emergencyBtn.classList.remove("emergency-active");
+        appendLog(controlLog, `[control] fallo en emergency stop: ${error.message}`);
+      } finally {
+        emergencyBtn.disabled = false;
+      }
+    }
+
+    emergencyBtn.addEventListener("click", triggerEmergencyStop);
+
+    window.addEventListener("beforeunload", () => {
+      if (socket) {
+        socket.close();
+      }
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+    });
+
+    connectTelemetry();
+  </script>
+</body>
+</html>

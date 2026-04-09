@@ -22,12 +22,14 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Literal
 
 import httpx
 import numpy as np
 from numpy.typing import NDArray
 
+from .audio_bridge import AudioHardwareBridge
+from .llm_client import OllamaAsyncClient
 
 # ---------------------------------------------------------------------------
 # Constantes de configuracion
@@ -705,6 +707,8 @@ class ConversationManager:
         *,
         local_strategy: LocalNLPPipeline,
         cloud_strategy: CloudNLPPipeline,
+        llm_client: Optional[OllamaAsyncClient] = None,
+        audio_bridge: Optional[AudioHardwareBridge] = None,
     ) -> None:
         # @TASK: Inicializar ConversationManager con ambas estrategias
         # @INPUT: local_strategy — LocalNLPPipeline; cloud_strategy — CloudNLPPipeline
@@ -725,14 +729,18 @@ class ConversationManager:
         self._total_interactions: int = 0
 
         # STEP 3: Estado de contenido de tour (script cargado en caliente)
-        # @TASK: Mantener referencia al guion y zona activa para inyeccion de system_prompt
+        # @TASK: Mantener referencia al guion y waypoint activo para inyeccion de prompt/script
         # @INPUT: Cargados via load_script_from_file() / set_active_zone()
         # @OUTPUT: _current_zone_prompt pre-calculado para eficiencia en cada interaccion
         # @CONTEXT: TourScript importado lazy para evitar circular con api.schemas
         # @SECURITY: El script se valida con Pydantic antes de asignarse
-        self._script: Optional[object] = None          # TourScript | None
-        self._current_zone: str = ""
-        self._current_zone_prompt: str = ""           # cache del system_prompt activo
+        self._script: Optional[object] = None
+        self._current_waypoint: str = ""
+        self._current_waypoint_prompt: str = ""
+        self._current_waypoint_interaction_type: Literal["scripted", "llm_qa"] = "llm_qa"
+        self._current_waypoint_script_text: str = ""
+        self._llm_client: OllamaAsyncClient = llm_client or OllamaAsyncClient()
+        self._audio_bridge: AudioHardwareBridge = audio_bridge or AudioHardwareBridge()
 
     @property
     def active_strategy_name(self) -> str:
@@ -765,7 +773,7 @@ class ConversationManager:
         @CONTEXT: Propiedad de observabilidad para /content/script endpoint
         @SECURITY: Solo lectura
         """
-        return self._current_zone
+        return self._current_waypoint
 
     @property
     def loaded_script(self) -> Optional[object]:
@@ -802,15 +810,15 @@ class ConversationManager:
 
         # STEP 3: persisitir y restaurar zona activa si sigue en el nuevo guion
         self._script = new_script
-        zone_ids = {z.zone_id for z in new_script.zones}
-        if self._current_zone not in zone_ids:
-            self._current_zone = new_script.zones[0].zone_id if new_script.zones else ""
-        self._refresh_zone_prompt()
+        waypoint_ids = {w.waypoint_id for w in new_script.waypoints}
+        if self._current_waypoint not in waypoint_ids:
+            self._current_waypoint = new_script.waypoints[0].waypoint_id if new_script.waypoints else ""
+        self._refresh_waypoint_cache()
         LOGGER.info(
-            "[CM] Script cargado: version='%s' zonas=%d zona_activa='%s'",
+            "[CM] Script cargado: version='%s' waypoints=%d waypoint_activo='%s'",
             new_script.version,
-            len(new_script.zones),
-            self._current_zone,
+            len(new_script.waypoints),
+            self._current_waypoint,
         )
 
     def set_active_zone(self, zone_id: str) -> None:
@@ -829,24 +837,22 @@ class ConversationManager:
             LOGGER.warning("[CM] set_active_zone('%s') ignorado: no hay script cargado.", zone_id)
             return
 
-        # STEP 2
-        zone = next(
-            (z for z in self._script.zones if z.zone_id == zone_id),
+        waypoint = next(
+            (w for w in self._script.waypoints if w.waypoint_id == zone_id),
             None,
         )
-        if zone is None:
+        if waypoint is None:
             raise ValueError(
-                f"zone_id='{zone_id}' no existe en el guion cargado "
+                f"waypoint_id='{zone_id}' no existe en el guion cargado "
                 f"(version='{self._script.version}'). "
-                f"Zonas validas: {[z.zone_id for z in self._script.zones]}"
+                f"Waypoints validos: {[w.waypoint_id for w in self._script.waypoints]}"
             )
 
-        # STEP 3
-        self._current_zone = zone_id
-        self._refresh_zone_prompt()
-        LOGGER.info("[CM] Zona activa cambiada a '%s'.", zone_id)
+        self._current_waypoint = zone_id
+        self._refresh_waypoint_cache()
+        LOGGER.info("[CM] Waypoint activo cambiado a '%s'.", zone_id)
 
-    def _refresh_zone_prompt(self) -> None:
+    def _refresh_waypoint_cache(self) -> None:
         """
         @TASK: Actualizar la cache del system_prompt de la zona activa
         @INPUT: Sin parametros (lee _script y _current_zone)
@@ -854,14 +860,23 @@ class ConversationManager:
         @CONTEXT: Helper interno; invocado por load_script_from_file y set_active_zone
         @SECURITY: Sin efectos secundarios externos
         """
-        if self._script is None or not self._current_zone:
-            self._current_zone_prompt = ""
+        if self._script is None or not self._current_waypoint:
+            self._current_waypoint_prompt = ""
+            self._current_waypoint_interaction_type = "llm_qa"
+            self._current_waypoint_script_text = ""
             return
-        zone = next(
-            (z for z in self._script.zones if z.zone_id == self._current_zone),
+        waypoint = next(
+            (w for w in self._script.waypoints if w.waypoint_id == self._current_waypoint),
             None,
         )
-        self._current_zone_prompt = zone.system_prompt if zone else ""
+        if waypoint is None:
+            self._current_waypoint_prompt = ""
+            self._current_waypoint_interaction_type = "llm_qa"
+            self._current_waypoint_script_text = ""
+            return
+        self._current_waypoint_prompt = waypoint.system_prompt or ""
+        self._current_waypoint_interaction_type = waypoint.interaction_type
+        self._current_waypoint_script_text = waypoint.script_text or ""
 
     def _build_zoned_text(self, user_text: str) -> str:
         """
@@ -874,10 +889,71 @@ class ConversationManager:
         @SECURITY: Sin modificacion del http client ni del payload JSON de Ollama;
                    solo se modifica el string de texto antes de construir ConversationRequest
         """
-        if self._current_zone_prompt:
-            # STEP 1: prepend zone system_prompt con separador canonico
-            return f"{self._current_zone_prompt}\n\nUsuario: {user_text}"
+        if self._current_waypoint_prompt:
+            return f"{self._current_waypoint_prompt}\n\nUsuario: {user_text}"
         return user_text  # STEP 2
+
+    def get_waypoint_interaction_type(self, waypoint_id: str) -> Literal["scripted", "llm_qa"]:
+        if self._script is None:
+            return "llm_qa"
+        waypoint = next(
+            (w for w in self._script.waypoints if w.waypoint_id == waypoint_id),
+            None,
+        )
+        if waypoint is None:
+            return "llm_qa"
+        return waypoint.interaction_type
+
+    async def process_scripted_interaction(self, waypoint_id: str) -> ConversationResponse:
+        if self._script is None:
+            return ConversationResponse(
+                answer_text="",
+                source_pipeline="scripted",
+                audio_stream_ready=False,
+            )
+        waypoint = next(
+            (w for w in self._script.waypoints if w.waypoint_id == waypoint_id),
+            None,
+        )
+        if waypoint is None or waypoint.interaction_type != "scripted":
+            return ConversationResponse(
+                answer_text="",
+                source_pipeline="scripted",
+                audio_stream_ready=False,
+            )
+        script_text = waypoint.script_text or ""
+        if not script_text:
+            return ConversationResponse(
+                answer_text="",
+                source_pipeline="scripted",
+                audio_stream_ready=False,
+            )
+        await self._local.synthesize_and_play(script_text)
+        return ConversationResponse(
+            answer_text=script_text,
+            source_pipeline="scripted",
+            audio_stream_ready=True,
+        )
+
+    def get_waypoint_pose_2d(self, waypoint_id: str) -> Optional[tuple[float, float, float]]:
+        if self._script is None:
+            return None
+        waypoint = next(
+            (w for w in self._script.waypoints if w.waypoint_id == waypoint_id),
+            None,
+        )
+        if waypoint is None:
+            return None
+        pose = getattr(waypoint, "pose_2d", None)
+        if not isinstance(pose, dict):
+            return None
+        try:
+            x = float(pose.get("x", 0.0))
+            y = float(pose.get("y", 0.0))
+            theta = float(pose.get("theta", 0.0))
+        except (TypeError, ValueError):
+            return None
+        return (x, y, theta)
 
     async def process_interaction(
         self,
@@ -898,6 +974,9 @@ class ConversationManager:
         # STEP 6: Actualizar telemetria y retornar respuesta
         # @SECURITY: audio_buffer no se persiste en ningun paso del pipeline
         # @AI_CONTEXT: STT y LLM tienen timeouts independientes para granularidad de hot-swap
+
+        if self._current_waypoint_interaction_type == "llm_qa":
+            return await self.start_interactive_session(self._current_waypoint)
 
         self._total_interactions += 1
         user_text: str = ""
@@ -1041,6 +1120,54 @@ class ConversationManager:
         return await self._cloud_fallback_text(
             raw_text=self._build_zoned_text(request.user_text)
         )
+
+    async def start_interactive_session(self, waypoint_id: str) -> ConversationResponse:
+        try:
+            self.set_active_zone(waypoint_id)
+        except Exception:
+            pass
+        system_prompt = self._current_waypoint_prompt.strip()
+        try:
+            user_input = await self._audio_bridge.listen_stt()
+            if not user_input:
+                message = "No detecte entrada de voz. Retornando a estado seguro."
+                await self._audio_bridge.speak_tts(message)
+                return ConversationResponse(
+                    answer_text=message,
+                    source_pipeline="llm_qa",
+                    audio_stream_ready=True,
+                )
+            composed_prompt = (
+                f"Contexto base: {system_prompt}\n"
+                f"Pregunta del usuario: {user_input}\n"
+                "Responde de manera concisa y tecnica:"
+            )
+            llm_response = await self._llm_client.generate_response(composed_prompt)
+            if not llm_response:
+                fallback = "Error de procesamiento de hardware. Retornando a estado seguro."
+                await self._audio_bridge.speak_tts(fallback)
+                return ConversationResponse(
+                    answer_text=fallback,
+                    source_pipeline="llm_qa",
+                    audio_stream_ready=True,
+                )
+            await self._audio_bridge.speak_tts(llm_response)
+            return ConversationResponse(
+                answer_text=llm_response,
+                source_pipeline="llm_qa",
+                audio_stream_ready=True,
+            )
+        except Exception:
+            fallback = "Error de procesamiento de hardware. Retornando a estado seguro."
+            try:
+                await self._audio_bridge.speak_tts(fallback)
+            except Exception:
+                pass
+            return ConversationResponse(
+                answer_text=fallback,
+                source_pipeline="llm_qa",
+                audio_stream_ready=False,
+            )
 
     def close(self) -> None:
         # @TASK: Liberar recursos de ambos pipelines en shutdown del sistema

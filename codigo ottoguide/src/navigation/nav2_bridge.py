@@ -354,6 +354,25 @@ class AsyncNav2Bridge:
             result = self._nav_status.last_result_succeeded
         return result is True
 
+    async def send_goal(self, waypoint: NavWaypoint) -> bool:
+        self._assert_started("send_goal")
+        async with self._status_lock:
+            self._nav_status.task_active = True
+            self._nav_status.last_result_succeeded = None
+            self._nav_status.active_waypoint_index = 0
+        self._nav_complete_event.clear()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self._work_executor,
+            self._send_goal_and_wait_sync,
+            waypoint,
+            loop,
+        )
+        await self._nav_complete_event.wait()
+        async with self._status_lock:
+            result = self._nav_status.last_result_succeeded
+        return result is True
+
     async def cancel_navigation(self) -> None:
         # @TASK: Cancelar la tarea de navegacion activa en BasicNavigator
         # @INPUT: Sin parametros
@@ -584,6 +603,31 @@ class AsyncNav2Bridge:
             "[Nav2Bridge] Plan Nav2 completado. Resultado: %s.",
             "SUCCEEDED" if succeeded else "FAILED",
         )
+
+    def _send_goal_and_wait_sync(
+        self,
+        waypoint: NavWaypoint,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        if self._navigator is None:
+            return
+        ros_pose = self._build_pose_stamped(waypoint)
+        go_to_pose = getattr(self._navigator, "goToPose", None)
+        if callable(go_to_pose):
+            go_to_pose(ros_pose)
+        else:
+            self._navigator.followWaypoints([ros_pose])
+
+        succeeded = False
+        while True:
+            if self._navigator.isTaskComplete():
+                result = self._navigator.getResult()
+                succeeded = getattr(result, "value", result) == 1
+                break
+            time.sleep(NAV2_TASK_POLL_INTERVAL_S)
+
+        loop.call_soon_threadsafe(self._set_nav_result_from_thread, succeeded)
+        loop.call_soon_threadsafe(self._nav_complete_event.set)
 
     def _set_nav_result_from_thread(self, succeeded: bool) -> None:
         # @TASK: Actualizar NavigationStatus desde el hilo de trabajo
