@@ -14,16 +14,31 @@ authors = [
 ]
 
 dependencies = [
+    # @TASK: Declarar dependencias reales del stack de produccion OttoGuide
+    # @INPUT: Importaciones activas en src/, hardware/, api/ y main.py
+    # @OUTPUT: Entorno reproducible via pip install -e .
+    # @CONTEXT: Unico manifest de dependencias; cyclonedds para DDS Unitree G1 EDU
+
+    # --- Servidor API ---
     "fastapi>=0.111",
     "uvicorn[standard]>=0.29",
     "pydantic-settings>=2.0",
-    "aiohttp>=3.9",
+
+    # --- Red / DDS ---
     "cyclonedds==0.10.2",
-    "python-statemachine>=2.3.0",
-    "numpy>=1.24",
+    "httpx>=0.27",              # Cliente HTTP async para Ollama y proveedores cloud NLP
+
+    # --- NLP / STT / TTS ---
+    "faster-whisper>=1.0",      # STT en CPU; reemplaza SpeechRecognition (eliminada)
+    "piper-tts>=1.2",           # TTS local edge; reemplaza pyttsx3 (eliminada)
+    "sounddevice>=0.4",         # Reproduccion PCM via ALSA
+
+    # --- Vision / Robotica ---
     "opencv-python-headless>=4.9",
-    "SpeechRecognition>=3.10",
-    "pyttsx3>=2.90",
+    "numpy>=1.24",
+
+    # --- Maquina de estados ---
+    "python-statemachine>=2.3.0",
 ]
 
 [project.optional-dependencies]

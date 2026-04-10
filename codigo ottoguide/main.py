@@ -1,16 +1,19 @@
-from __future__ import annotations
+"""
+@TASK: Unico entrypoint del sistema OttoGuide
+@INPUT: Variables de entorno (ROBOT_MODE, etc.) via config/settings.py
+@OUTPUT: Stack robotico activo; FastAPI + Uvicorn serviendo en API_HOST:API_PORT
+@CONTEXT: Reemplaza main.py, api_server.py y server.py anteriores
+@SECURITY: damp() garantizado en cualquier causa de shutdown
+@AI_CONTEXT: Cero sys.path.append; cero imports de unitree_sdk2py
 
-# @TASK: Unico entrypoint del sistema OttoGuide
-# @INPUT: Variables de entorno (ROBOT_MODE, etc.) via config/settings.py
-# @OUTPUT: Stack robotico activo; FastAPI + Uvicorn serviendo en API_HOST:API_PORT
-# @CONTEXT: Reemplaza main.py, api_server.py y server.py anteriores
-# STEP 1: Crear FastAPI con asynccontextmanager lifespan
-# STEP 2: lifespan: hardware = get_hardware_adapter(), await initialize()
-# STEP 3: lifespan: app.state.orchestrator = TourOrchestrator(hardware)
-# STEP 4: lifespan yield; en shutdown: await hardware.damp() garantizado
-# STEP 5: uvicorn.run con factory=True
-# @SECURITY: damp() garantizado en cualquier causa de shutdown
-# @AI_CONTEXT: Cero sys.path.append; cero imports de unitree_sdk2py
+STEP 1: Crear FastAPI con asynccontextmanager lifespan
+STEP 2: lifespan: hardware = get_hardware_adapter(), await initialize()
+STEP 3: lifespan: app.state.orchestrator = TourOrchestrator(hardware)
+STEP 4: lifespan yield; en shutdown: await hardware.damp() garantizado
+STEP 5: uvicorn.run con factory=True
+"""
+
+from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -64,18 +67,16 @@ async def lifespan(app: FastAPI):
     hardware: Optional[RobotHardwareInterface] = None
 
     try:
-        # STEP 1
         LOGGER.info(
             "[BOOT] Inicializando hardware. ROBOT_MODE=%s",
             settings.ROBOT_MODE,
         )
         hardware = get_hardware_adapter()
 
-        # STEP 2
         await hardware.initialize()
         LOGGER.info("[BOOT] Hardware inicializado correctamente.")
 
-        # STEP 3: Instanciar orquestador con dependencias congeladas
+        # Instanciar orquestador con dependencias congeladas
         # Los modulos congelados siguen usando src.* — no modificar sus imports
         from src.core import TourOrchestrator
 
@@ -86,6 +87,7 @@ async def lifespan(app: FastAPI):
             vision_processor=_get_vision_processor_stub(),
             telemetry_manager=telemetry_manager,
             mission_audit_logger=MISSION_AUDIT_LOGGER,
+            robot_mode=settings.ROBOT_MODE,
         )
         app.state.orchestrator = orchestrator
         LOGGER.info(
@@ -93,11 +95,10 @@ async def lifespan(app: FastAPI):
             orchestrator.state_id,
         )
 
-        # STEP 4
         yield
 
     finally:
-        # STEP 5: damp() garantizado en cualquier ruta de salida
+        # damp() garantizado en cualquier ruta de salida
         if hardware is not None:
             LOGGER.info(
                 "[SHUTDOWN] Ejecutando damp() (timeout=%.1fs).",
@@ -195,34 +196,133 @@ def _get_vision_processor_stub():
 
 
 class _MinimalNavStub:
-    """Stub minimo para AsyncNav2Bridge cuando ROS 2 no esta disponible."""
-    async def start(self): pass
-    async def close(self): pass
-    async def navigate_to_waypoints(self, waypoints): return False
-    async def cancel_navigation(self): pass
-    async def inject_absolute_pose(self, pose): pass
+    """
+    @TASK: Proveer stub minimo de AsyncNav2Bridge para entornos sin ROS 2
+    @INPUT: Llamadas de TourOrchestrator a operaciones de navegacion
+    @OUTPUT: Respuestas no operativas pero tipadas para mantener compatibilidad
+    @CONTEXT: Fallback de bootstrap en CI o entornos sin stack Nav2
+    @SECURITY: No inicializa ROS 2 ni ejecuta I/O externo
+    """
+
+    async def start(self):
+        """
+        @TASK: Simular inicio del bridge de navegacion
+        @INPUT: Sin parametros
+        @OUTPUT: Retorno inmediato
+        @CONTEXT: Stub no operativo
+        @SECURITY: Sin side effects
+        """
+        return None
+
+    async def close(self):
+        """
+        @TASK: Simular cierre del bridge de navegacion
+        @INPUT: Sin parametros
+        @OUTPUT: Retorno inmediato
+        @CONTEXT: Stub no operativo
+        @SECURITY: Sin side effects
+        """
+        return None
+
+    async def navigate_to_waypoints(self, waypoints):
+        """
+        @TASK: Simular navegacion por waypoints
+        @INPUT: waypoints
+        @OUTPUT: False para indicar no ejecucion de navegacion real
+        @CONTEXT: Fallback de compatibilidad cuando Nav2 no esta disponible
+        @SECURITY: No despacha movimiento fisico
+        """
+        return False
+
+    async def cancel_navigation(self):
+        """
+        @TASK: Simular cancelacion de navegacion
+        @INPUT: Sin parametros
+        @OUTPUT: Retorno inmediato
+        @CONTEXT: Stub no operativo
+        @SECURITY: Sin side effects
+        """
+        return None
+
+    async def inject_absolute_pose(self, pose):
+        """
+        @TASK: Simular inyeccion de pose absoluta
+        @INPUT: pose
+        @OUTPUT: Retorno inmediato
+        @CONTEXT: Stub no operativo
+        @SECURITY: No publica en ROS 2
+        """
+        return None
 
 
 class _MinimalConversationStub:
-    """Stub minimo para ConversationManager cuando Ollama no esta disponible."""
+    """
+    @TASK: Proveer stub minimo de ConversationManager sin backend NLP real
+    @INPUT: Solicitudes de interaccion del orquestador
+    @OUTPUT: Respuestas vacias compatibles con el contrato esperado
+    @CONTEXT: Fallback de bootstrap cuando Ollama no esta disponible
+    @SECURITY: Sin llamadas a APIs externas ni ejecucion de modelos remotos
+    """
+
     swap_count = 0
     active_strategy_name = "stub"
+
     async def process_interaction(self, audio, *, language="es"):
+        """
+        @TASK: Simular procesamiento de interaccion conversacional
+        @INPUT: audio, language
+        @OUTPUT: Objeto StubResponse con payload vacio
+        @CONTEXT: Ruta de fallback en entornos sin pipeline conversacional
+        @SECURITY: No transmite audio fuera del proceso
+        """
         from dataclasses import dataclass
+
         @dataclass
         class StubResponse:
             answer_text: str = ""
             source_pipeline: str = "stub"
             audio_stream_ready: bool = False
         return StubResponse()
+
     async def respond(self, request):
+        """
+        @TASK: Simular endpoint de respuesta conversacional
+        @INPUT: request
+        @OUTPUT: Delega en process_interaction con salida stub
+        @CONTEXT: Compatibilidad con consumidores existentes
+        @SECURITY: Sin side effects externos
+        """
         return await self.process_interaction(None)
 
 
 class _MinimalVisionStub:
-    """Stub minimo para VisionProcessor cuando no hay camara."""
-    def close(self): pass
-    async def get_next_estimate(self, *, timeout_s=0.5): return None
+    """
+    @TASK: Proveer stub minimo de VisionProcessor sin acceso a camara
+    @INPUT: Llamadas del orquestador a cierre y lectura de estimaciones
+    @OUTPUT: Cierre no operativo y ausencia de estimaciones
+    @CONTEXT: Fallback para CI/mock sin dispositivo D435i
+    @SECURITY: No intenta abrir hardware de video
+    """
+
+    def close(self):
+        """
+        @TASK: Simular cierre del procesador de vision
+        @INPUT: Sin parametros
+        @OUTPUT: Retorno inmediato
+        @CONTEXT: Stub no operativo
+        @SECURITY: Sin side effects
+        """
+        return None
+
+    async def get_next_estimate(self, *, timeout_s=0.5):
+        """
+        @TASK: Simular lectura de siguiente estimacion de vision
+        @INPUT: timeout_s
+        @OUTPUT: None para indicar ausencia de datos
+        @CONTEXT: Stub no operativo sin pipeline de camara
+        @SECURITY: No realiza I/O de hardware
+        """
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +335,7 @@ def create_app() -> FastAPI:
     @INPUT: Sin parametros
     @OUTPUT: FastAPI app con lifespan y router incluido
     @CONTEXT: Invocada por uvicorn con factory=True
-    @SECURITY: docs_url=None en produccion; habilitar para desarrollo
+    @SECURITY: La politica de exposicion de documentacion OpenAPI se gestiona fuera de esta factory.
     """
     _configure_logging()
 
@@ -284,11 +384,13 @@ def _configure_logging() -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # @TASK: Lanzar servidor con uvicorn
-    # @INPUT: Sin parametros CLI
-    # @OUTPUT: Proceso HTTP activo en API_HOST:API_PORT
-    # @CONTEXT: Ejecutable como: python main.py
-    # @SECURITY: KeyboardInterrupt suprimida; SIGINT capturada por uvicorn
+    """
+    @TASK: Lanzar servidor con uvicorn
+    @INPUT: Sin parametros CLI
+    @OUTPUT: Proceso HTTP activo en API_HOST:API_PORT
+    @CONTEXT: Ejecutable como: python main.py
+    @SECURITY: KeyboardInterrupt suprimida; SIGINT capturada por uvicorn
+    """
     settings = get_settings()
     with contextlib.suppress(KeyboardInterrupt):
         uvicorn.run(

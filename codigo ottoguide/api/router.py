@@ -1,16 +1,20 @@
+"""
+@TASK: Definir router FastAPI con endpoints de control, observabilidad y gestion de contenido
+@INPUT: TourOrchestrator y ConversationManager inyectados via app.state en el lifespan de FastAPI
+@OUTPUT: APIRouter con POST /tour/start, /tour/pause, /emergency, GET /status,
+         GET /content/script, POST /content/script/reload, WS /ws/telemetry
+@CONTEXT: Capa de interfaz HTTP; cero logica de negocio en este archivo.
+          Todos los efectos de dominio se delegan al TourOrchestrator o ConversationManager.
+@SECURITY: TransitionNotAllowed → HTTP 409; docs de OpenAPI desactivadas en produccion.
+
+STEP 1: Registrar endpoints de mutacion de estado FSM (POST)
+STEP 2: Registrar endpoints de observabilidad de solo lectura (GET, WS)
+STEP 3: Registrar endpoints de gestion de contenido de guion (GET/POST)
+"""
 from __future__ import annotations
 
-# @TASK: Definir router FastAPI con endpoints de control, observabilidad y gestion de contenido
-# @INPUT: TourOrchestrator y ConversationManager inyectados via app.state
-# @OUTPUT: APIRouter con POST /tour/start, /tour/pause, /emergency, GET /status,
-#          GET /content/script, POST /content/script/reload
-# @CONTEXT: Capa de interfaz HTTP; cero logica de negocio en este archivo
-# @SECURITY: TransitionNotAllowed → HTTP 409; docs desactivadas en produccion
-# STEP 1: Registrar endpoints de mutacion de estado (POST)
-# STEP 2: Registrar endpoints de observabilidad (GET)
-# STEP 3: Registrar endpoints de gestion de contenido (GET/POST)
-
 import asyncio
+import functools
 import logging
 from pathlib import Path
 from typing import Optional
@@ -34,7 +38,27 @@ from .schemas import (
 LOGGER = logging.getLogger("otto_guide.api.router")
 
 router = APIRouter()
-telemetry_manager = TelemetryManager()
+
+
+# ---------------------------------------------------------------------------
+# Singleton de TelemetryManager (patron formal)
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=1)
+def get_telemetry_manager() -> TelemetryManager:
+    """
+    @TASK: Obtener instancia singleton del TelemetryManager de WebSocket
+    @INPUT: Sin parametros
+    @OUTPUT: Unica instancia de TelemetryManager por proceso
+    @CONTEXT: lru_cache garantiza una sola instancia incluso ante reimports
+    @SECURITY: Sin estado mutable global expuesto; acceso via esta funcion
+    """
+    return TelemetryManager()
+
+
+# Alias de compatibilidad para main.py (from api.router import telemetry_manager)
+telemetry_manager: TelemetryManager = get_telemetry_manager()
+
 
 
 # ---------------------------------------------------------------------------
@@ -194,41 +218,30 @@ async def endpoint_emergency(
     }
 
 
-@router.post(
-    "/api/emergency_stop",
-    status_code=status.HTTP_200_OK,
-    summary="Kill switch de emergencia para detener la FSM inmediatamente",
-)
-async def endpoint_emergency_stop(
-    orchestrator=Depends(_get_orchestrator),
-) -> dict:
-    nav_bridge = getattr(orchestrator, "_nav_bridge", None)
-    if nav_bridge is not None:
-        try:
-            await asyncio.wait_for(nav_bridge.cancel_navigation(), timeout=1.0)
-        except Exception as exc:
-            LOGGER.error("[API] cancel_navigation previo a kill switch fallo: %s", exc)
 
-    try:
-        await asyncio.wait_for(orchestrator.emergency_stop(reason="api_kill_switch"), timeout=5.0)
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Timeout activando emergency_stop",
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error activando emergency_stop: {exc}",
-        )
 
-    return {"status": "emergency_engaged"}
 
 
 @router.websocket("/ws/telemetry")
 async def websocket_telemetry(
     websocket: WebSocket,
 ) -> None:
+    """
+    @TASK: Gestionar conexion WebSocket para transmision de telemetria FSM en tiempo real
+    @INPUT: websocket — instancia WebSocket de FastAPI gestionada por el framework;
+            telemetry_manager — Singleton del broadcast pool (accedido via closure del modulo)
+    @OUTPUT: Stream de payloads JSON de telemetria enviados al cliente; ninguna mutacion de estado FSM.
+             Side-effect: conexion registrada y desregistrada del pool de broadcast.
+    @CONTEXT: El cliente recibe un snapshot inicial del estado FSM al conectarse
+              (build_telemetry_payload), luego permanece suscrito hasta la desconexion.
+              telemetry_manager.broadcast() es invocado por el orquestador para propagar
+              cambios de estado a todos los clientes suscritos de forma concurrente.
+
+    STEP 1: Registrar el WebSocket en el TelemetryManager (pool de broadcast activo)
+    STEP 2: Enviar snapshot inicial del estado FSM si el orquestador esta disponible en app.state
+    STEP 3: Mantener el loop de recepcion activo; desconectar limpiamente ante WebSocketDisconnect
+            o cualquier excepcion no controlada
+    """
     await telemetry_manager.connect(websocket)
     try:
         orchestrator = getattr(websocket.app.state, "orchestrator", None)
@@ -339,21 +352,21 @@ async def endpoint_get_script(
 ) -> TourScript:
     """
     @TASK: Retornar el guion de tour actualmente cargado en ConversationManager
-    @INPUT: Sin parametros
-    @OUTPUT: TourScript serializado en JSON
-    @CONTEXT: Observabilidad del estado de contenido; sin efectos secundarios
-    STEP 1: Verificar que hay un script cargado
-    STEP 2: Retornar el objeto TourScript serializado por Pydantic
+    @INPUT: Sin parametros de request; cm — ConversationManager resuelto via Depends
+    @OUTPUT: TourScript serializado en JSON; HTTP 404 si no hay guion cargado
+    @CONTEXT: Observabilidad del estado de contenido; sin efectos secundarios ni mutacion de estado.
+              El script se carga previamente via POST /content/script/reload.
+
+    STEP 1: Verificar que cm.loaded_script no es None; HTTP 404 si es el caso
+    STEP 2: Retornar el objeto TourScript; Pydantic gestiona la serializacion automaticamente
     @SECURITY: Solo lectura; sin mutacion de estado
     """
-    # STEP 1
     script = cm.loaded_script
     if script is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No hay guion cargado. Usar POST /content/script/reload para cargar.",
         )
-    # STEP 2
     return script
 
 
@@ -368,18 +381,21 @@ async def endpoint_reload_script(
 ) -> ScriptReloadResponse:
     """
     @TASK: Forzar recarga del guion de tour desde data/mvp_tour_script.json
-    @INPUT: Sin payload
-    @OUTPUT: ScriptReloadResponse con version y cantidad de waypoints cargados
-    @CONTEXT: Permite actualizacion de contenido en caliente sin reiniciar el proceso
-    STEP 1: Verificar existencia del archivo en la ruta default
-    STEP 2: Invocar load_script_from_file() de forma asincrona en executor
-    STEP 3: Retornar confirmacion con datos del script recargado
-    @SECURITY: Ruta de archivo fija en el servidor; sin parametro de ruta en la API
-               FileNotFoundError y ValidationError retornan HTTP 422
+    @INPUT: Sin payload de request; cm — ConversationManager resuelto via Depends
+    @OUTPUT: ScriptReloadResponse con version y cantidad de waypoints cargados;
+             HTTP 422 ante archivo inexistente o error de validacion Pydantic
+    @CONTEXT: Permite actualizacion de contenido en caliente sin reiniciar el proceso.
+              load_script_from_file() es sincrona (I/O de disco + validacion Pydantic);
+              se ejecuta en executor de IO para no bloquear el event loop de FastAPI.
+
+    STEP 1: Verificar existencia del archivo en la ruta default (_SCRIPT_DEFAULT_PATH)
+    STEP 2: Invocar load_script_from_file() en executor de IO via run_in_executor
+    STEP 3: Leer el script recargado desde cm.loaded_script y retornar confirmacion
+    @SECURITY: Ruta de archivo fija en el servidor; sin parametro de ruta en la API.
+               FileNotFoundError y ValidationError retornan HTTP 422.
     """
     script_path = _SCRIPT_DEFAULT_PATH
 
-    # STEP 1
     if not script_path.exists():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -387,7 +403,6 @@ async def endpoint_reload_script(
                    "Crear data/mvp_tour_script.json a partir de la plantilla.",
         )
 
-    # STEP 2: load_script_from_file es sincrono (I/O de disco + Pydantic); ejecutar en executor
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, cm.load_script_from_file, script_path)
@@ -397,7 +412,6 @@ async def endpoint_reload_script(
             detail=f"Error al cargar el guion: {exc}",
         )
 
-    # STEP 3
     script = cm.loaded_script
     LOGGER.info(
         "[API] POST /content/script/reload exitoso. version='%s' waypoints=%d",

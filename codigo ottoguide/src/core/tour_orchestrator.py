@@ -1,15 +1,27 @@
-from __future__ import annotations
+"""
+@TASK: Implementar orquestador central de tour integrando todos los subsistemas HIL Fase 6
+@INPUT: Instancias activas de RobotHardwareAPI, AsyncNav2Bridge, ConversationManager, VisionProcessor
+@OUTPUT: Maquina de estados asincrona con callbacks de integracion completa por estado;
+         efectos de lado: movimiento del robot, TTS, inyeccion de odometria, telemetria WebSocket,
+         persistencia de eventos de auditoria en JSON
+@CONTEXT: Modulo central de control; unico coordinador de subsistemas durante el tour.
+          python-statemachine AsyncEngine gestiona todos los callbacks de forma no bloqueante.
+          configuration[0].id se usa para leer el estado activo (current_state esta deprecado).
+@SECURITY: EMERGENCY es la unica transicion con prioridad absoluta; Damp() se invoca primero.
 
-# @TASK: Implementar orquestador central de tour integrando todos los subsistemas HIL Fase 6
-# @INPUT: Instancias activas de RobotHardwareAPI, AsyncNav2Bridge, ConversationManager, VisionProcessor
-# @OUTPUT: Maquina de estados asincrona con callbacks de integracion completa por estado
-# @CONTEXT: Modulo central de control; unico coordinador de subsistemas durante el tour
-# STEP 1: Definir grafo de estados (IDLE, NAVIGATING, INTERACTING, EMERGENCY)
-# STEP 2: Implementar callbacks on_enter/on_exit con logica de integracion real
-# STEP 3: Gestionar tareas background (odometria, audio, nav) con cancel seguro
-# STEP 4: Exponer dispatch_tour para integracion con FastAPI BackgroundTasks
-# @SECURITY: EMERGENCY es la unica transicion con prioridad absoluta; Damp() se invoca primero
-# @AI_CONTEXT: python-statemachine AsyncEngine; configuration[0].id para leer estado activo
+STEP 1: Definir grafo de estados (IDLE, NAVIGATING, INTERACTING, EMERGENCY) en TourOrchestrator
+STEP 2: Implementar callbacks on_enter/on_exit con logica de integracion real de subsistemas
+STEP 3: Gestionar tareas background (odometria, nav) con cancelacion segura via CancelledError
+STEP 4: Exponer dispatch_tour para integracion con FastAPI BackgroundTasks
+
+Constantes operativas del modulo:
+  DAMP_TIMEOUT_S (1.5 s)           — Cota dura de tiempo de reaccion ante EMERGENCY; no elevar
+  AUDIO_CAPTURE_TIMEOUT_S (8.0 s)  — Timeout de interaccion NLP; ajustar segun duracion del wake-word
+  ODOMETRY_INJECT_TIMEOUT_S (0.5 s)— Timeout de inyeccion de odometria en AsyncNav2Bridge
+  WAYPOINT_POLL_INTERVAL_S (0.1 s) — Intervalo de ceder el event loop entre waypoints consecutivos
+  NAV_TASK_SETTLE_S (0.05 s)       — Pausa tras cancel de tarea background para settledness del loop
+"""
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -25,6 +37,7 @@ from statemachine import State, StateMachine
 from statemachine.engines.async_ import AsyncEngine
 
 from src.hardware import RobotHardwareAPI, RobotHardwareAPIError
+from src.hardware.interface import MotionCommand
 from src.api.websocket_manager import TelemetryManager
 from src.core.mission_audit import MissionAuditLogger
 from src.interaction import ConversationManager, ConversationRequest, ConversationResponse
@@ -36,21 +49,11 @@ from src.vision import OdometryVector, VisionProcessor
 # Constantes de operacion
 # ---------------------------------------------------------------------------
 
-# @TASK: Declarar timeouts operativos del orquestador
-# @INPUT: Ninguno
-# @OUTPUT: Constantes de timeout para cada subsistema integrado
-# @CONTEXT: Calibradas para robot fisico en entorno indoor air-gapped
-# STEP 1: Timeout de Damp en EMERGENCY (critico; no puede ser elevado)
-# STEP 2: Timeout de captura de audio para interaccion
-# STEP 3: Timeout de inyeccion de odometria en bridge
-# STEP 4: Intervalo de sondeo de proximidad a waypoints
-# @SECURITY: DAMP_TIMEOUT_S es la cota dura de tiempo de reaccion ante emergencia
-# @AI_CONTEXT: Ajustar AUDIO_CAPTURE_TIMEOUT_S segun duracion esperada del wake-word
 DAMP_TIMEOUT_S: float = 1.5
 AUDIO_CAPTURE_TIMEOUT_S: float = 8.0
 ODOMETRY_INJECT_TIMEOUT_S: float = 0.5
 WAYPOINT_POLL_INTERVAL_S: float = 0.1
-NAV_TASK_SETTLE_S: float = 0.05   # pausa tras cancel de tarea background
+NAV_TASK_SETTLE_S: float = 0.05
 
 LOGGER = logging.getLogger(__name__)
 ROBOT_MODE_REAL: str = "real"
@@ -62,14 +65,18 @@ ROBOT_MODE_REAL: str = "real"
 
 @dataclass(slots=True)
 class TourContext:
-    # @TASK: Encapsular estado mutable del tour activo para observabilidad externa
-    # @INPUT: Actualizaciones incrementales desde los callbacks del orquestador
-    # @OUTPUT: Snapshot del tour consultable por APIServer y telemetria
-    # @CONTEXT: Objeto mutable compartido entre estados; no thread-safe (solo event loop)
-    # STEP 1: Registrar plan de waypoints, indice de posicion y ultima interaccion
-    # STEP 2: Mantener causa de la ultima emergencia para diagnostico post-mortem
-    # @SECURITY: No persistir en disco; solo en memoria durante la sesion
-    # @AI_CONTEXT: Consultado por APIServer via propiedad orchestrator.context
+    """
+    @TASK: Encapsular el estado mutable del tour activo para observabilidad externa
+    @INPUT: Actualizaciones incrementales desde los callbacks del orquestador en cada transicion
+    @OUTPUT: Snapshot del tour consultable por APIServer y broadcast WebSocket en cualquier instante
+    @CONTEXT: Objeto mutable compartido entre todos los estados de la FSM; no thread-safe, destinado
+              exclusivamente al event loop principal. Consultado via propiedad orchestrator.context.
+    @SECURITY: No persistir en disco; solo en memoria durante la sesion activa del proceso.
+
+    STEP 1: Registrar plan de waypoints, indice de posicion actual y ultima respuesta de interaccion
+    STEP 2: Mantener last_error con la causa de la ultima emergencia para diagnostico post-mortem
+    """
+
     waypoint_plan: list[NavWaypoint] = field(default_factory=list)
     current_waypoint_index: int = 0
     last_interaction: Optional[ConversationResponse] = None
@@ -79,13 +86,17 @@ class TourContext:
 
 @dataclass(frozen=True, slots=True)
 class TourPlan:
-    # @TASK: Encapsular el plan de un tour como una secuencia tipada de waypoints
-    # @INPUT: Lista de NavWaypoint y identificador de sesion opcional
-    # @OUTPUT: Estructura inmutable despachada a dispatch_tour()
-    # @CONTEXT: Contrato de entrada del endpoint FastAPI para iniciar un tour
-    # STEP 1: Definir lista de waypoints y id de tour para trazabilidad
-    # @SECURITY: Frozen; no puede ser mutado por el caller tras el despacho
-    # @AI_CONTEXT: tours_id permite correlacionar logs con sesiones HTTP
+    """
+    @TASK: Encapsular el plan de un tour como una secuencia tipada e inmutable de waypoints
+    @INPUT: Lista de NavWaypoint validados por el endpoint FastAPI y un identificador de sesion opcional
+    @OUTPUT: Estructura frozen despachada como argumento unico a dispatch_tour()
+    @CONTEXT: Contrato de entrada del endpoint POST /tour/start. tour_id permite correlacionar logs
+              de auditoria JSON con sesiones HTTP especificas para trazabilidad end-to-end.
+    @SECURITY: Frozen (inmutable tras construccion); no puede ser mutado por el caller tras el despacho.
+
+    STEP 1: Definir lista de waypoints y tour_id para trazabilidad de la sesion
+    """
+
     waypoints: list[NavWaypoint]
     tour_id: str = "unidentified"
 
@@ -95,19 +106,31 @@ class TourPlan:
 # ---------------------------------------------------------------------------
 
 class TourOrchestrator(StateMachine):
+    """
+    @TASK: Implementar la FSM central que coordina todos los subsistemas HIL del robot guia universitario
+    @INPUT: Dependencias inyectadas via constructor DI: hardware_api, nav_bridge, conversation_manager,
+            vision_processor, telemetry_manager, mission_audit_logger, damp_timeout_s, robot_mode
+    @OUTPUT: FSM de 4 estados con callbacks async completos y los siguientes efectos de lado:
+             movimiento del robot via HAL, reproduccion de audio TTS, inyeccion de odometria AMCL,
+             broadcast de telemetria WebSocket, persistencia de eventos de auditoria en JSON
+    @CONTEXT: Clase central del sistema; unica instancia en el lifespan de FastAPI referenciada via
+              app.state.orchestrator. python-statemachine con AsyncEngine para callbacks no bloqueantes.
+    @SECURITY: La transicion trigger_emergency tiene prioridad absoluta desde cualquier estado operativo.
+               El estado EMERGENCY es final (python-statemachine final=True); no hay salida automatica.
+
+    Grafo de estados:
+      IDLE --(start_tour)--> NAVIGATING
+      NAVIGATING --(pause_for_interaction)--> INTERACTING
+      INTERACTING --(resume_tour)--> NAVIGATING
+      NAVIGATING --(finish_tour)--> IDLE
+      ANY --(trigger_emergency)--> EMERGENCY (final)
+
+    Meta.engine = AsyncEngine garantiza que todos los on_enter_*/on_exit_* sean awaitable.
+    """
 
     # ------------------------------------------------------------------
     # Definicion del grafo de estados
     # ------------------------------------------------------------------
-
-    # @TASK: Declarar estados del tour con restriccion de estado inicial IDLE
-    # @INPUT: Definiciones de State de python-statemachine
-    # @OUTPUT: Grafo de 4 estados operativos del robot guia
-    # @CONTEXT: Los estados reflejan el modo de operacion del robot en todo momento
-    # STEP 1: Declarar IDLE como el unico estado inicial
-    # STEP 2: Declarar NAVIGATING, INTERACTING y EMERGENCY como estados operativos
-    # @SECURITY: EMERGENCY no tiene transicion de salida automatica; requiere confirmacion
-    # @AI_CONTEXT: python-statemachine usa el nombre del atributo como id del estado
 
     idle: State = State("IDLE", initial=True)
     navigating: State = State("NAVIGATING")
@@ -117,17 +140,6 @@ class TourOrchestrator(StateMachine):
     # ------------------------------------------------------------------
     # Definicion de transiciones
     # ------------------------------------------------------------------
-
-    # @TASK: Declarar transiciones validas entre estados del tour
-    # @INPUT: Relaciones origen->destino del protocolo de operacion
-    # @OUTPUT: Eventos asincronos invocables via await en el orquestador
-    # @CONTEXT: Contrato de flujo de control; restricciones de concurrencia aplicadas
-    # STEP 1: Transicion nominal idle->navigating para inicio de tour
-    # STEP 2: Transicion simetrica navigating<->interacting para ventana de dialogo
-    # STEP 3: Transicion de retorno navigating->idle al completar el plan
-    # STEP 4: Transicion de emergencia desde cualquier estado operativo
-    # @SECURITY: trigger_emergency es la unica transicion de alta prioridad; no requiere state check
-    # @AI_CONTEXT: El uso de | expresa origen multiple para una misma transicion
 
     start_tour = idle.to(navigating)
     pause_for_interaction = navigating.to(interacting)
@@ -140,13 +152,15 @@ class TourOrchestrator(StateMachine):
     )
 
     class Meta:
-        # @TASK: Forzar motor asíncrono para todos los callbacks de estado
-        # @INPUT: AsyncEngine de python-statemachine
-        # @OUTPUT: Todos los on_enter/on_exit ejecutados con await
-        # @CONTEXT: Requisito critico para no bloquear el event loop principal
-        # STEP 1: Asignar AsyncEngine a engine en Meta
-        # @SECURITY: Sin AsyncEngine los callbacks sync bloquean el loop
-        # @AI_CONTEXT: AsyncEngine es compatible con python-statemachine >= 0.9
+        """
+        @TASK: Configurar el motor asíncrono de python-statemachine para todos los callbacks de estado
+        @INPUT: AsyncEngine importado desde statemachine.engines.async_
+        @OUTPUT: Todos los metodos on_enter_*/on_exit_* ejecutados con await en el event loop activo
+        @CONTEXT: Requisito critico para no bloquear el event loop principal de FastAPI/uvicorn.
+                  Compatible con python-statemachine >= 0.9.
+        @SECURITY: Sin AsyncEngine los callbacks sincronos bloquean el event loop; el sistema entero se congela.
+        """
+
         engine = AsyncEngine
 
     # ------------------------------------------------------------------
@@ -164,26 +178,45 @@ class TourOrchestrator(StateMachine):
         mission_audit_logger: Optional[MissionAuditLogger] = None,
         damp_timeout_s: float = DAMP_TIMEOUT_S,
         audio_capture_timeout_s: float = AUDIO_CAPTURE_TIMEOUT_S,
+        robot_mode: str = "mock",
     ) -> None:
-        # @TASK: Inyectar dependencias de todos los subsistemas e inicializar estado interno
-        # @INPUT: Instancias activas de los 4 subsistemas HIL; timeouts configurables
-        # @OUTPUT: Orquestador en estado IDLE con contexto limpio y tareas background = None
-        # @CONTEXT: Constructor DI; todos los subsistemas deben estar en estado ACTIVO
-        # STEP 1: Validar parametros criticos de seguridad antes de asignacion
-        # STEP 2: Persistir referencias a todos los subsistemas inyectados
-        # STEP 3: Inicializar contexto de tour y handles de tareas background a None
-        # STEP 4: Emitir advertencia CRITICAL de override mecanico al arrancar
-        # STEP 5: Llamar super().__init__() para que python-statemachine initcialice el grafo
-        # @SECURITY: damp_timeout_s >= 0.5 s es requisito fisico; por debajo puede no propagarse via DDS
-        # @AI_CONTEXT: Las tareas background (_odometry_task, _nav_task) se crean en on_enter_navigating
+        """
+        @TASK: Inyectar dependencias de todos los subsistemas e inicializar el estado interno de la FSM
+        @INPUT: hardware_api — adaptador HAL activo (real/sim/mock) que implementa RobotHardwareInterface
+                nav_bridge — puente async a ROS 2 Nav2; puede ser stub en modo mock
+                conversation_manager — gestor NLP con estrategia local/cloud intercambiable
+                vision_processor — procesador de odometria visual via AprilTags y camara D435i
+                telemetry_manager — gestor de broadcast WebSocket (opcional; None desactiva telemetria)
+                mission_audit_logger — persistencia de eventos de mision en JSON (opcional)
+                damp_timeout_s — timeout fisico de Damp() en segundos; debe ser >= 0.5 s
+                audio_capture_timeout_s — timeout maximo del pipeline NLP completo en segundos
+                robot_mode — "real" | "sim" | "mock"; inyectado desde config/settings.py (no de os.environ)
+        @OUTPUT: Instancia de TourOrchestrator en estado IDLE con los atributos inicializados:
+                 _hardware_api, _nav_bridge, _conversation_manager, _vision_processor — subsistemas activos;
+                 _telemetry_manager, _mission_audit_logger — servicios opcionales;
+                 _damp_timeout_s, _audio_capture_timeout_s, _robot_mode — parametros de configuracion;
+                 _context: TourContext — estado mutable del tour, limpio;
+                 _odometry_task: Optional[Task[None]] = None — handle de tarea de odometria;
+                 _nav_task: Optional[Task[None]] = None — handle de tarea de navegacion;
+                 _interaction_done_event: asyncio.Event — evento de sincronizacion de dialogo;
+                 _pending_audio: np.ndarray = zeros(1, float32) — buffer PCM del wake-word pendiente;
+                 _pending_language: str = "es" — idioma del audio pendiente
+        @CONTEXT: Constructor DI; todos los subsistemas deben estar en estado ACTIVO antes de inyectar.
+                  super().__init__() se invoca al final para que python-statemachine inicialice el grafo.
+        @SECURITY: damp_timeout_s <= 0 lanza ValueError; por debajo de 0.5 s puede no propagarse via DDS.
+                   LOGGER.critical al arrancar advierte del kill switch mecanico L1+A disponible.
 
-        # STEP 1
+        STEP 1: Validar parametros criticos de seguridad (ValueError si damp o audio timeout <= 0)
+        STEP 2: Persistir referencias a todos los subsistemas inyectados como atributos privados
+        STEP 3: Inicializar contexto del tour, handles de tareas background y atributos de interaccion pendiente
+        STEP 4: Emitir advertencia CRITICAL de kill switch mecanico al arrancar
+        STEP 5: Invocar super().__init__() para que python-statemachine inicialice el grafo de estados
+        """
         if damp_timeout_s <= 0:
             raise ValueError("damp_timeout_s debe ser mayor que 0.")
         if audio_capture_timeout_s <= 0:
             raise ValueError("audio_capture_timeout_s debe ser mayor que 0.")
 
-        # STEP 2
         self._hardware_api: RobotHardwareAPI = hardware_api
         self._nav_bridge: AsyncNav2Bridge = nav_bridge
         self._conversation_manager: ConversationManager = conversation_manager
@@ -192,21 +225,21 @@ class TourOrchestrator(StateMachine):
         self._mission_audit_logger: Optional[MissionAuditLogger] = mission_audit_logger
         self._damp_timeout_s: float = damp_timeout_s
         self._audio_capture_timeout_s: float = audio_capture_timeout_s
+        self._robot_mode: str = robot_mode.strip().lower()
 
-        # STEP 3
         self._context: TourContext = TourContext()
         self._odometry_task: Optional[asyncio.Task[None]] = None
         self._nav_task: Optional[asyncio.Task[None]] = None
         self._interaction_done_event: asyncio.Event = asyncio.Event()
+        self._pending_audio: np.ndarray = np.zeros(1, dtype=np.float32)
+        self._pending_language: str = "es"
 
-        # STEP 4
         LOGGER.critical(
             "[SAFETY] TourOrchestrator inicializado. "
             "L1+A en el mando fuerza Damp mecanico inmediato. "
             "Control manual y API simultaneos estan estrictamente prohibidos en NAVIGATING."
         )
 
-        # STEP 5
         super().__init__()
 
     # ------------------------------------------------------------------
@@ -215,27 +248,34 @@ class TourOrchestrator(StateMachine):
 
     @property
     def context(self) -> TourContext:
-        # @TASK: Exponer contexto del tour activo para telemetria externa
-        # @INPUT: Sin parametros
-        # @OUTPUT: TourContext mutable con estado actual del recorrido
-        # @CONTEXT: Consumido por APIServer para responder a solicitudes de estado
-        # STEP 1: Retornar referencia al contexto interno
-        # @SECURITY: Solo lectura recomendada; no mutar desde fuera del orquestador
-        # @AI_CONTEXT: tour_id, current_waypoint_index y last_error son los campos clave
-        return self._context  # STEP 1
+        """
+        @TASK: Exponer el contexto mutable del tour activo para telemetria y observabilidad externa
+        @INPUT: Sin parametros
+        @OUTPUT: Referencia al TourContext interno con tour_id, current_waypoint_index,
+                 last_interaction, last_error y waypoint_plan
+        @CONTEXT: Consumido por APIServer para responder a GET /status y por el broadcast WebSocket.
+                  Los campos clave son tour_id, current_waypoint_index y last_error.
+        @SECURITY: Solo lectura recomendada desde fuera del orquestador; mutar externamente puede
+                   causar race conditions con los callbacks de estado de la FSM.
+        """
+        return self._context
 
     @property
     def state_id(self) -> str:
-        # @TASK: Retornar el identificador canonico del estado activo actual
-        # @INPUT: Sin parametros
-        # @OUTPUT: String con id del estado (idle, navigating, interacting, emergency)
-        # @CONTEXT: Reemplaza current_state deprecated; usa configuration[0].id
-        # STEP 1: Leer configuracion activa; retornar "uninitialized" si vacia
-        # @SECURITY: Solo lectura; no activa transiciones
-        # @AI_CONTEXT: Usar este metodo en lugar de current_state en toda la codebase
+        """
+        @TASK: Retornar el identificador canonico del estado activo actual de la FSM
+        @INPUT: Sin parametros
+        @OUTPUT: String con id del estado ("idle", "navigating", "interacting", "emergency");
+                 "uninitialized" si la configuracion de la FSM esta vacia
+        @CONTEXT: Reemplaza current_state (deprecado en python-statemachine); usa configuration[0].id.
+                  Debe usarse en toda la codebase en lugar de acceder a current_state directamente.
+        @SECURITY: Solo lectura; no activa transiciones ni tiene side-effects de ningun tipo.
+
+        STEP 1: Leer la configuracion activa de la FSM; retornar "uninitialized" si la lista esta vacia
+        """
         cfg = self.configuration
         if not cfg:
-            return "uninitialized"  # STEP 1
+            return "uninitialized"
         return next(iter(cfg)).id
 
     # ------------------------------------------------------------------
@@ -243,24 +283,27 @@ class TourOrchestrator(StateMachine):
     # ------------------------------------------------------------------
 
     async def dispatch_tour(self, plan: TourPlan) -> None:
-        # @TASK: Despachar un plan de tour como tarea background no bloqueante para FastAPI
-        # @INPUT: plan — TourPlan con lista de NavWaypoint y tour_id
-        # @OUTPUT: Transicion a NAVIGATING; retorno inmediato al caller de FastAPI
-        # @CONTEXT: Punto de entrada para el endpoint POST /tour/start; no debe bloquear la ruta HTTP
-        # STEP 1: Validar que el orquestador este en IDLE antes de aceptar el plan
-        # STEP 2: Persistir el plan en el contexto y resetear indice de waypoints
-        # STEP 3: Ejecutar la transicion start_tour via AsyncEngine
-        # STEP 4: Lanzar el bucle de navegacion como background task (create_task)
-        # @SECURITY: Si el orquestador no esta en IDLE, rechazar con excepcion clara
-        # @AI_CONTEXT: FastAPI debe invocar este metodo dentro de un BackgroundTask para no bloquear la respuesta HTTP
+        """
+        @TASK: Despachar un plan de tour como tarea background no bloqueante para FastAPI
+        @INPUT: plan — TourPlan con lista de NavWaypoint y tour_id de sesion
+        @OUTPUT: _context actualizado con el plan; transicion a NAVIGATING ejecutada;
+                 _navigation_loop lanzado como asyncio.Task; retorno inmediato sin bloquear el loop HTTP
+        @CONTEXT: Punto de entrada del endpoint POST /tour/start. FastAPI debe invocarlo dentro
+                  de BackgroundTasks para no bloquear la respuesta HTTP al cliente.
+        @SECURITY: Si el orquestador no esta en IDLE, se rechaza con RuntimeError antes de cualquier
+                   mutacion de estado, garantizando que no se despachan tours concurrentes.
 
-        # STEP 1
+        STEP 1: Validar que el estado actual es "idle"; RuntimeError con detalle si no lo es
+        STEP 2: Persistir el plan en _context y resetear current_waypoint_index a 0
+        STEP 3: Programar evento de auditoria TOUR_START via _schedule_audit_event
+        STEP 4: Ejecutar transicion start_tour via AsyncEngine (activa on_enter_navigating)
+        STEP 5: Lanzar _navigation_loop como asyncio.Task con nombre trazable "nav-loop-{tour_id}"
+        """
         if self.state_id != "idle":
             raise RuntimeError(
                 f"dispatch_tour() rechazado: estado actual es '{self.state_id}', se requiere 'idle'."
             )
 
-        # STEP 2
         self._context.waypoint_plan = list(plan.waypoints)
         self._context.current_waypoint_index = 0
         self._context.tour_id = plan.tour_id
@@ -275,10 +318,8 @@ class TourOrchestrator(StateMachine):
             },
         )
 
-        # STEP 3
         await self.start_tour()
 
-        # STEP 4: el bucle real de navegacion corre como background task
         self._nav_task = asyncio.create_task(
             self._navigation_loop(),
             name=f"nav-loop-{plan.tour_id}",
@@ -294,45 +335,49 @@ class TourOrchestrator(StateMachine):
         audio_buffer: NDArray[np.float32],
         language: str = "es",
     ) -> None:
-        # @TASK: Solicitar transicion a INTERACTING desde una fuente externa (wake-word detector)
-        # @INPUT: audio_buffer — PCM float32 del wake-word capturado; language
-        # @OUTPUT: Transicion a INTERACTING; audio procesado y reproducido; retorno a NAVIGATING
-        # @CONTEXT: Invocado por el detector de wake-word o por endpoint fastAPI /interaction
-        # STEP 1: Verificar que el estado actual es NAVIGATING; ignorar si no lo es
-        # STEP 2: Persistir audio_buffer en contexto para consumo en on_enter_interacting
-        # STEP 3: Ejecutar transicion pause_for_interaction via AsyncEngine
-        # @SECURITY: Solo transible desde NAVIGATING; evita conflictos de estado multi-fuente
-        # @AI_CONTEXT: on_enter_interacting consume _pending_audio y llama process_interaction
+        """
+        @TASK: Solicitar transicion a INTERACTING desde una fuente externa (wake-word detector o API)
+        @INPUT: audio_buffer — PCM float32 del wake-word ya capturado por el detector externo
+                language — codigo ISO del idioma del audio (default "es")
+        @OUTPUT: _pending_audio y _pending_language actualizados; transicion pause_for_interaction
+                 ejecutada; control devuelto tras activar on_enter_interacting en el AsyncEngine
+        @CONTEXT: Invocado por el detector de wake-word o por el endpoint POST /tour/pause.
+                  on_enter_interacting consume _pending_audio y delega a process_interaction().
+        @SECURITY: Solo transitable desde NAVIGATING; en cualquier otro estado se ignora con
+                   logging.debug, evitando conflictos por multiples fuentes de activacion concurrentes.
 
-        # STEP 1
+        STEP 1: Verificar estado "navigating"; logging.debug y retorno inmediato si no corresponde
+        STEP 2: Persistir audio_buffer en _pending_audio y language en _pending_language
+        STEP 3: Ejecutar transicion pause_for_interaction via AsyncEngine
+        """
         if self.state_id != "navigating":
             LOGGER.debug(
                 "[Orchestrator] request_interaction ignorado: estado='%s'", self.state_id
             )
             return
 
-        # STEP 2
-        self._pending_audio: NDArray[np.float32] = audio_buffer
-        self._pending_language: str = language
+        self._pending_audio = audio_buffer
+        self._pending_language = language
 
-        # STEP 3
         await self.pause_for_interaction()
 
     async def emergency_stop(self, reason: str = "manual") -> None:
-        # @TASK: Activar la transicion de emergencia desde cualquier estado operativo
-        # @INPUT: reason — descripcion de la causa de emergencia para diagnostico
-        # @OUTPUT: Transicion a EMERGENCY; Damp() ejecutado; subsistemas detenidos
-        # @CONTEXT: Invocable desde APIServer, señal OS o excepcion no recuperable
-        # STEP 1: Registrar causa en contexto antes de la transicion
-        # STEP 2: Ejecutar trigger_emergency via AsyncEngine
-        # @SECURITY: No hace verificacion de estado previo; trigger_emergency acepta cualquier origen
-        # @AI_CONTEXT: El callback on_enter_emergency es el que ejecuta Damp() y limpia tareas
+        """
+        @TASK: Activar la transicion de emergencia desde cualquier estado operativo de la FSM
+        @INPUT: reason — descripcion de la causa de emergencia para diagnostico y auditoria
+        @OUTPUT: _context.last_error actualizado con reason; transicion trigger_emergency ejecutada;
+                 on_enter_emergency invocado por AsyncEngine (Damp() + limpieza de subsistemas)
+        @CONTEXT: Invocable desde APIServer, señal del OS, o cualquier excepcion no recuperable.
+                  trigger_emergency acepta cualquier estado origen; no requiere verificacion previa.
+        @SECURITY: Este metodo NO ejecuta Damp() directamente; delega en on_enter_emergency que lo hace
+                   como STEP 3, garantizando la secuencia correcta de cancelacion antes que hardware.
 
-        # STEP 1
+        STEP 1: Registrar reason en _context.last_error y emitir LOGGER.critical para trazabilidad
+        STEP 2: Ejecutar trigger_emergency via AsyncEngine para activar el callback on_enter_emergency
+        """
         self._context.last_error = reason
         LOGGER.critical("[Orchestrator] EMERGENCY STOP solicitado. Razon: %s", reason)
 
-        # STEP 2
         await self.trigger_emergency()
 
     # ------------------------------------------------------------------
@@ -340,16 +385,19 @@ class TourOrchestrator(StateMachine):
     # ------------------------------------------------------------------
 
     async def on_enter_navigating(self) -> None:
-        # @TASK: Iniciar bucle de inyeccion de odometria visual como background task
-        # @INPUT: Sin parametros directos; usa _vision_processor y _nav_bridge internos
-        # @OUTPUT: _odometry_task activa consumiendo VisionProcessor.pose_queue
-        # @CONTEXT: Callback invocado por AsyncEngine al entrar a NAVIGATING
-        # STEP 1: Crear tarea background para consumo continuo de odometria visual
-        # STEP 2: Registrar la tarea en _odometry_task para cancelacion en on_exit_navigating
-        # @SECURITY: La tarea se crea con nombre descriptivo para identificacion en debugging
-        # @AI_CONTEXT: _navigation_loop ya fue creado en dispatch_tour; este callback solo inicia odometria
+        """
+        @TASK: Iniciar el bucle de inyeccion de odometria visual como background task al entrar a NAVIGATING
+        @INPUT: Sin parametros directos; opera sobre _vision_processor y _nav_bridge inyectados
+        @OUTPUT: _odometry_task creada y activa consumiendo OdometryVector de VisionProcessor.pose_queue;
+                 broadcast de telemetria programado para notificar el nuevo estado
+        @CONTEXT: Callback invocado por AsyncEngine al completar start_tour o resume_tour.
+                  _navigation_loop fue creado previamente en dispatch_tour; este callback solo inicia odometria.
+        @SECURITY: La tarea se crea solo si _odometry_task es None o ya termino, previniendo duplicados.
 
-        # STEP 1 + 2
+        STEP 1: Crear asyncio.Task de _odometry_injection_loop si no existe una activa en _odometry_task
+        STEP 2: Registrar la nueva tarea en _odometry_task para su cancelacion en on_exit_navigating
+        STEP 3: Programar broadcast de telemetria para notificar el ingreso a NAVIGATING
+        """
         if self._odometry_task is None or self._odometry_task.done():
             self._odometry_task = asyncio.create_task(
                 self._odometry_injection_loop(),
@@ -359,20 +407,31 @@ class TourOrchestrator(StateMachine):
         self._schedule_telemetry_broadcast()
 
     async def on_enter_idle(self) -> None:
+        """
+        @TASK: Ejecutar acciones de entrada al estado IDLE al completar un tour
+        @INPUT: Sin parametros
+        @OUTPUT: Broadcast de telemetria programado para notificar el retorno a IDLE
+        @CONTEXT: Callback invocado por AsyncEngine al completar la transicion finish_tour.
+                  Estado de reposo; no activa tareas background ni comandos de hardware.
+        @SECURITY: Sin acciones de hardware; operacion de solo observabilidad y telemetria.
+        """
         self._schedule_telemetry_broadcast()
 
     async def on_exit_navigating(self) -> None:
-        # @TASK: Cancelar la tarea de inyeccion de odometria al salir de NAVIGATING
-        # @INPUT: Sin parametros
-        # @OUTPUT: _odometry_task cancelada y awaited; recursos liberados
-        # @CONTEXT: Callback invocado por AsyncEngine antes de ejecutar cualquier salida de NAVIGATING
-        # STEP 1: Cancelar _odometry_task si esta activa y no terminada
-        # STEP 2: Await con suppress para absorber CancelledError sin propagar
-        # STEP 3: Limpiar referencia para evitar referencias a tareas finalizadas
-        # @SECURITY: on_exit garantiza que no haya inyeccion de odometria en estados no-NAVIGATING
-        # @AI_CONTEXT: La tarea de navegacion Nav2 se cancela por separado en _navigation_loop
+        """
+        @TASK: Cancelar el bucle de inyeccion de odometria al salir del estado NAVIGATING
+        @INPUT: Sin parametros; opera sobre el atributo _odometry_task
+        @OUTPUT: _odometry_task cancelada y awaited; recursos del bucle liberados; _odometry_task = None
+        @CONTEXT: Callback invocado por AsyncEngine antes de ejecutar cualquier transicion de salida
+                  de NAVIGATING (hacia INTERACTING, IDLE o EMERGENCY).
+                  La tarea de Nav2 (_navigation_loop) se cancela por separado en los callbacks de destino.
+        @SECURITY: Garantiza que no haya inyeccion de odometria activa en estados no-NAVIGATING,
+                   previniendo correcciones AMCL mientras el robot esta interactuando o en emergencia.
 
-        # STEP 1
+        STEP 1: Verificar que _odometry_task existe y no ha terminado; cancelar si esta activa
+        STEP 2: Await con absorcion de CancelledError (es el mecanismo normal de terminacion del bucle)
+        STEP 3: Asignar _odometry_task = None para estado limpio independientemente del resultado
+        """
         if self._odometry_task is not None and not self._odometry_task.done():
             self._odometry_task.cancel()
             try:
@@ -380,23 +439,28 @@ class TourOrchestrator(StateMachine):
             except asyncio.CancelledError:
                 pass
 
-        # STEP 3
         self._odometry_task = None
         LOGGER.info("[Orchestrator] on_exit_navigating: Tarea de odometria cancelada.")
 
     async def on_enter_interacting(self) -> None:
-        # @TASK: Detener el robot, procesar audio via ConversationManager y retornar a NAVIGATING
-        # @INPUT: _pending_audio y _pending_language seteados por request_interaction()
-        # @OUTPUT: Robot detenido; respuesta TTS reproducida; transicion automatica a NAVIGATING
-        # @CONTEXT: Callback de INTERACTING; se ejecuta sincrono hasta que el dialogo termina
-        # STEP 1: Cancelar navegacion Nav2 activa para detener cinematica del robot
-        # STEP 2: Enviar velocidad cero como refuerzo de detencion (failsafe)
-        # STEP 3: Invocar ConversationManager.process_interaction() con el audio pendiente
-        # STEP 4: Registrar respuesta en contexto
-        # STEP 5: Ejecutar transicion automatica de vuelta a NAVIGATING via resume_tour
-        # @SECURITY: Paso 1 (cancel Nav2) antes del paso 2 (velocidad cero) para evitar conflicto de comandos
-        # @AI_CONTEXT: La reproduccion TTS es fire-and-forget; no esperamos el fin del audio aqui
+        """
+        @TASK: Detener el robot, ejecutar el pipeline de dialogo completo y retornar automaticamente a NAVIGATING
+        @INPUT: _pending_audio — PCM float32 seteado por request_interaction() (default zeros si ausente)
+                _pending_language — idioma seteado por request_interaction() (default "es" si ausente)
+        @OUTPUT: Robot detenido cinematicamente; respuesta TTS procesada; _context.last_interaction
+                 actualizado; evento INTERACTION_COMPLETED auditado; transicion resume_tour ejecutada
+        @CONTEXT: Callback de INTERACTING invocado por AsyncEngine. Sincrono hasta que el dialogo
+                  termina; bloquea el callback hasta que resume_tour es ejecutado en STEP 5.
+                  La reproduccion TTS es interna al ConversationManager (fire-and-forget).
+        @SECURITY: STEP 1 (cancel Nav2) debe preceder siempre a STEP 2 (velocidad cero) para evitar
+                   conflicto de comandos de movimiento entre Nav2 y el HAL directo.
 
+        STEP 1: Cancelar _nav_task y enviar cancel_navigation() al bridge para detener cinematica
+        STEP 2: Enviar MotionCommand(linear_x=0, angular_z=0) como failsafe cinematico adicional
+        STEP 3: Resolver tipo de interaccion del waypoint y ejecutar pipeline (scripted o libre via STT)
+        STEP 4: Registrar respuesta en _context.last_interaction y programar evento de auditoria
+        STEP 5: Ejecutar transicion resume_tour; ante fallo, activar emergency_stop como fallback
+        """
         audio_buffer: NDArray[np.float32] = getattr(
             self, "_pending_audio", np.zeros(1, dtype=np.float32)
         )
@@ -406,20 +470,17 @@ class TourOrchestrator(StateMachine):
         self._schedule_telemetry_broadcast()
         LOGGER.info("[Orchestrator] on_enter_interacting: Iniciando secuencia de dialogo.")
 
-        # STEP 1: Cancelar navegacion activa
         await self._cancel_nav_task_safe()
         await self._nav_bridge.cancel_navigation()
 
-        # STEP 2: Velocidad cero como failsafe cinematico
         try:
             await asyncio.wait_for(
-                self._hardware_api.move(0.0, 0.0, 0.0),
+                self._hardware_api.move(MotionCommand(linear_x=0.0, angular_z=0.0, duration_ms=0)),
                 timeout=0.5,
             )
         except Exception as exc:
             LOGGER.warning("[Orchestrator] Fallo al enviar velocidad cero: %s", exc)
 
-        # STEP 3: Resolver tipo de interaccion por waypoint y ejecutar pipeline correspondiente
         try:
             interaction_type = self._conversation_manager.get_waypoint_interaction_type(waypoint_id)
             self._conversation_manager.set_active_zone(waypoint_id)
@@ -459,7 +520,6 @@ class TourOrchestrator(StateMachine):
                 audio_stream_ready=False,
             )
 
-        # STEP 4: Registrar en contexto
         self._context.last_interaction = response
         self._schedule_audit_event(
             event_type="INTERACTION_COMPLETED",
@@ -475,7 +535,6 @@ class TourOrchestrator(StateMachine):
             getattr(self._conversation_manager, "swap_count", "?"),
         )
 
-        # STEP 5: Retorno automatico a NAVIGATING
         try:
             await self.resume_tour()
         except Exception as exc:
@@ -486,19 +545,25 @@ class TourOrchestrator(StateMachine):
             await self.emergency_stop(reason=f"resume_tour fallo: {exc}")
 
     async def on_enter_emergency(self) -> None:
-        # @TASK: Ejecutar secuencia de emergencia perentoria ante cualquier fallo critico
-        # @INPUT: Sin parametros; _context.last_error contiene la causa registrada
-        # @OUTPUT: Damp() ejecutado; tareas background canceladas; VisionProcessor detenido
-        # @CONTEXT: Callback de estado EMERGENCY; la secuencia es irreversible desde esta clase
-        # STEP 1: Cancelar todas las tareas background (nav y odometria) sin esperar
-        # STEP 2: Cancelar la navegacion activa en Nav2Bridge
-        # STEP 3: Invocar Damp() en hardware con timeout estricto DAMP_TIMEOUT_S
-        # STEP 4: Invocar velocidad cero como redundancia tras Damp()
-        # STEP 5: Cerrar VisionProcessor para liberar el bus USB
-        # STEP 6: Registrar estado final para diagnostico
-        # @SECURITY: Damp() es el PRIMER comando de hardware ejecutado (STEP 3 antes que qualquier otro)
-        # @AI_CONTEXT: Este estado es final (python-statemachine final=True); no hay transicion de salida
+        """
+        @TASK: Ejecutar la secuencia de emergencia perentoria e irreversible ante cualquier fallo critico
+        @INPUT: Sin parametros directos; _context.last_error contiene la causa registrada por emergency_stop()
+        @OUTPUT: Todas las tareas background canceladas; Nav2 detenido; Damp() ejecutado en hardware;
+                 VisionProcessor cerrado; eventos de auditoria y telemetria registrados
+        @CONTEXT: Callback del estado final EMERGENCY invocado por AsyncEngine. Irreversible desde esta clase
+                  (python-statemachine final=True; no hay transicion de salida automatica).
+                  Todos los errores en STEPs posteriores a Damp() se absorben para garantizar
+                  la ejecucion completa de la secuencia de cierre.
+        @SECURITY: Damp() es el PRIMER comando de hardware ejecutado (STEP 3); ninguna otra operacion
+                   de hardware precede a Damp() para garantizar la caida segura ante cualquier estado.
 
+        STEP 1: Cancelar _nav_task y _odometry_task via _cancel_*_safe() sin propagar excepciones
+        STEP 2: Enviar cancel_navigation() al Nav2Bridge con timeout de 1.0 s
+        STEP 3: Invocar Damp() en hardware con timeout _damp_timeout_s (primera accion de hardware)
+        STEP 4: Enviar MotionCommand de velocidad cero como redundancia cinematica tras Damp()
+        STEP 5: Invocar VisionProcessor.close() para liberar el bus USB y el thread de captura
+        STEP 6: Registrar estado final del sistema via LOGGER.critical para diagnostico post-mortem
+        """
         LOGGER.critical(
             "[Orchestrator] EMERGENCY activado. Causa: %s",
             self._context.last_error,
@@ -513,11 +578,9 @@ class TourOrchestrator(StateMachine):
             },
         )
 
-        # STEP 1: Cancelar tareas background
         await self._cancel_nav_task_safe()
         await self._cancel_odometry_task_safe()
 
-        # STEP 2: Cancelar navegacion Nav2
         try:
             await asyncio.wait_for(
                 self._nav_bridge.cancel_navigation(),
@@ -526,7 +589,6 @@ class TourOrchestrator(StateMachine):
         except Exception as exc:
             LOGGER.error("[Orchestrator] Fallo al cancelar Nav2 en emergencia: %s", exc)
 
-        # STEP 3: Damp() — primera accion sobre hardware fisico
         LOGGER.critical(
             "[Orchestrator] Emitiendo Damp() al hardware (timeout=%.1f s).",
             self._damp_timeout_s,
@@ -551,23 +613,20 @@ class TourOrchestrator(StateMachine):
                 exc,
             )
 
-        # STEP 4: Velocidad cero como redundancia
         try:
             await asyncio.wait_for(
-                self._hardware_api.move(0.0, 0.0, 0.0),
+                self._hardware_api.move(MotionCommand(linear_x=0.0, angular_z=0.0, duration_ms=0)),
                 timeout=0.5,
             )
         except Exception:
-            pass  # En emergencia, si move falla es aceptable; Damp ya fue enviado
+            pass
 
-        # STEP 5: Cerrar VisionProcessor (liberar bus USB y thread de captura)
         try:
             self._vision_processor.close()
             LOGGER.info("[Orchestrator] VisionProcessor cerrado en EMERGENCY.")
         except Exception as exc:
             LOGGER.error("[Orchestrator] Fallo al cerrar VisionProcessor: %s", exc)
 
-        # STEP 6
         LOGGER.critical(
             "[Orchestrator] Secuencia de EMERGENCY completada. "
             "Estado: %s | Causa: %s",
@@ -580,18 +639,27 @@ class TourOrchestrator(StateMachine):
     # ------------------------------------------------------------------
 
     async def _navigation_loop(self) -> None:
-        # @TASK: Ejecutar el plan de navegacion enviando waypoints secuencialmente a Nav2Bridge
-        # @INPUT: _context.waypoint_plan — lista de NavWaypoint del TourPlan activo
-        # @OUTPUT: Robot desplazado hasta cada waypoint; finish_tour al completar el plan
-        # @CONTEXT: Tarea background creada en dispatch_tour y cancelada por on_exit_navigating
-        # STEP 1: Iterar sobre cada waypoint del plan enviando uno por vez a Nav2Bridge
-        # STEP 2: Esperar completitud de la tarea Nav2 (navigate_to_waypoints es bloqueante async)
-        # STEP 3: Actualizar indice de waypoint en contexto para observabilidad
-        # STEP 4: Al finalizar todos los waypoints, ejecutar finish_tour
-        # STEP 5: Capturar CancelledError (cancelacion por interaccion o emergencia)
-        # @SECURITY: La tarea puede ser cancelada en cualquier momento; CancelledError es el mecanismo normal
-        # @AI_CONTEXT: Si Nav2 no completa un waypoint, se registra el fallo y continua con el siguiente
+        """
+        @TASK: Ejecutar el plan de navegacion enviando waypoints secuencialmente a AsyncNav2Bridge
+        @INPUT: _context.waypoint_plan — lista de NavWaypoint del TourPlan activo
+        @OUTPUT: Robot desplazado hasta cada waypoint del plan; _context.current_waypoint_index
+                 actualizado en cada iteracion; evento NODE_REACHED auditado por waypoint exitoso;
+                 finish_tour y TOUR_END ejecutados al completar el plan completo
+        @CONTEXT: asyncio.Task creada en dispatch_tour con nombre "nav-loop-{tour_id}".
+                  Cancelable en cualquier momento via _cancel_nav_task_safe() desde on_enter_interacting
+                  o on_enter_emergency. CancelledError es el mecanismo normal de terminacion anticipada.
+        @SECURITY: asyncio.CancelledError se re-propaga siempre para que asyncio contabilice la cancelacion.
+                   Fallos de Nav2 en waypoints individuales se logean con LOGGER.error y se continua con
+                   el siguiente waypoint sin abortar el tour completo.
 
+        STEP 1: Iterar sobre el plan con enumerate; actualizar _context.current_waypoint_index en cada ciclo
+        STEP 2: Resolver NavWaypoint de destino via _resolve_navigation_target (pose real o fallback)
+        STEP 3: Enviar waypoint a Nav2Bridge (send_goal en modo real; navigate_to_waypoints en mock/sim)
+        STEP 4: Registrar NODE_REACHED si success; LOGGER.warning si fallo sin abortar
+        STEP 5: Ceder al event loop con asyncio.sleep(WAYPOINT_POLL_INTERVAL_S) entre waypoints
+        STEP 6: Al completar todos los waypoints, invocar finish_tour y registrar TOUR_END
+        STEP 7: Re-propagar CancelledError desde el bloque except externo para terminacion limpia
+        """
         plan = self._context.waypoint_plan
         LOGGER.info(
             "[Orchestrator] _navigation_loop iniciado. %d waypoints.", len(plan)
@@ -599,7 +667,6 @@ class TourOrchestrator(StateMachine):
 
         try:
             for idx, waypoint in enumerate(plan):
-                # STEP 3
                 self._context.current_waypoint_index = idx
                 logical_waypoint_id = self._resolve_logical_waypoint_id_by_index(idx)
                 nav_target = self._resolve_navigation_target(
@@ -612,15 +679,12 @@ class TourOrchestrator(StateMachine):
                     nav_target.x, nav_target.y, nav_target.yaw_rad,
                 )
 
-                # STEP 2: Enviar waypoint individual como lista unitaria
                 try:
-                    robot_mode = os.environ.get("ROBOT_MODE", "").strip().lower()
-                    if robot_mode == ROBOT_MODE_REAL and hasattr(self._nav_bridge, "send_goal"):
+                    if self._robot_mode == ROBOT_MODE_REAL and hasattr(self._nav_bridge, "send_goal"):
                         success = await self._nav_bridge.send_goal(nav_target)
                     else:
                         success = await self._nav_bridge.navigate_to_waypoints([nav_target])
                 except asyncio.CancelledError:
-                    # STEP 5: Propagacion de cancelacion desde on_exit_navigating o EMERGENCY
                     LOGGER.info(
                         "[Orchestrator] _navigation_loop cancelado en waypoint %d.", idx
                     )
@@ -646,10 +710,8 @@ class TourOrchestrator(StateMachine):
                         },
                     )
 
-                # Ceder al event loop entre waypoints para procesabilidad de señales
                 await asyncio.sleep(WAYPOINT_POLL_INTERVAL_S)
 
-            # STEP 4: Plan completado
             LOGGER.info("[Orchestrator] Plan de navegacion completado.")
             if self.state_id == "navigating":
                 await self.finish_tour()
@@ -664,34 +726,37 @@ class TourOrchestrator(StateMachine):
 
         except asyncio.CancelledError:
             LOGGER.info("[Orchestrator] _navigation_loop terminado por cancelacion.")
-            raise  # re-propagar para que asyncio lo maneje correctamente
+            raise
 
     async def _odometry_injection_loop(self) -> None:
-        # @TASK: Consumir OdometryVector de VisionProcessor y despacharlos a AsyncNav2Bridge
-        # @INPUT: vision_processor.pose_queue — asyncio.Queue[OdometryVector]
-        # @OUTPUT: Correcciones AMCL inyectadas continuamente en /initialpose via Nav2Bridge
-        # @CONTEXT: Tarea background activa durante NAVIGATING; cancelada en on_exit_navigating
-        # STEP 1: Esperar el siguiente OdometryVector de la cola con timeout corto
-        # STEP 2: Inyectar la estimacion de pose en AsyncNav2Bridge.inject_absolute_pose
-        # STEP 3: Ante CancelledError, terminar limpiamente
-        # @SECURITY: El timeout en get_next_estimate evita que la tarea quede bloqueada indefinidamente
-        # @AI_CONTEXT: Si la cola esta vacia (sin tags detectados), el loop espera silenciosamente
+        """
+        @TASK: Consumir OdometryVector de VisionProcessor y despacharlos a AsyncNav2Bridge para correccion AMCL
+        @INPUT: _vision_processor.pose_queue — asyncio.Queue[OdometryVector] alimentada por el hilo de vision
+        @OUTPUT: Estimaciones de pose AMCL inyectadas continuamente en /initialpose via inject_absolute_pose();
+                 sin retorno; terminacion via CancelledError desde on_exit_navigating
+        @CONTEXT: asyncio.Task activa exclusivamente durante el estado NAVIGATING.
+                  Si la cola esta vacia (sin AprilTags detectados), el loop cede el event loop y reintenta.
+                  El timeout de 0.5 s en get_next_estimate evita bloqueo indefinido ante ausencia de tags.
+        @SECURITY: CancelledError se re-propaga siempre para terminacion limpia de la tarea.
+                   Excepciones de inject_absolute_pose se absorben con logging.error sin abortar el loop.
 
+        STEP 1: Esperar el proximo OdometryVector con timeout de 0.5 s; ceder si no hay estimacion
+        STEP 2: Inyectar la estimacion de pose via inject_absolute_pose con timeout ODOMETRY_INJECT_TIMEOUT_S
+        STEP 3: Ceder el event loop con asyncio.sleep(0.0) tras cada inyeccion exitosa
+        STEP 4: Re-propagar CancelledError en el bloque except externo para terminacion limpia
+        """
         LOGGER.info("[Orchestrator] Bucle de inyeccion odometrica iniciado.")
 
         try:
             while True:
-                # STEP 1
                 odometry: Optional[OdometryVector] = await self._vision_processor.get_next_estimate(
                     timeout_s=0.5
                 )
 
                 if odometry is None:
-                    # Sin deteccion reciente; ceder al loop y reintentar
                     await asyncio.sleep(0.0)
                     continue
 
-                # STEP 2
                 try:
                     await asyncio.wait_for(
                         self._nav_bridge.inject_absolute_pose(odometry.pose_estimate),
@@ -712,10 +777,9 @@ class TourOrchestrator(StateMachine):
                         type(exc).__name__, exc,
                     )
 
-                await asyncio.sleep(0.0)  # ceder al event loop
+                await asyncio.sleep(0.0)
 
         except asyncio.CancelledError:
-            # STEP 3
             LOGGER.info("[Orchestrator] Bucle de odometria terminado por cancelacion.")
             raise
 
@@ -724,48 +788,69 @@ class TourOrchestrator(StateMachine):
     # ------------------------------------------------------------------
 
     async def _cancel_nav_task_safe(self) -> None:
-        # @TASK: Cancelar _nav_task de forma segura sin propagar CancelledError
-        # @INPUT: Sin parametros
-        # @OUTPUT: _nav_task cancelada y awaited; referencia limpiada
-        # @CONTEXT: Utilitario invocado desde on_enter_interacting y on_enter_emergency
-        # STEP 1: Verificar que la tarea existe y no esta terminada
-        # STEP 2: Cancelar y await con suppress para absorber CancelledError
-        # STEP 3: Limpiar referencia tras cancelacion
-        # @SECURITY: suppress(CancelledError) es intencional; la tarea fue cancelada explicitamente
-        # @AI_CONTEXT: La tarea Nav2 interna de navigate_to_waypoints se cancela por separado en Nav2Bridge
+        """
+        @TASK: Cancelar _nav_task de forma segura sin propagar CancelledError al caller
+        @INPUT: Sin parametros; opera sobre el atributo de instancia _nav_task
+        @OUTPUT: _nav_task.cancel() invocado; tarea awaited; _nav_task = None para estado limpio
+        @CONTEXT: Utilitario invocado desde on_enter_interacting y on_enter_emergency.
+                  La tarea Nav2 interna de navigate_to_waypoints se cancela por separado en Nav2Bridge.
+        @SECURITY: La absorcion de CancelledError es intencional; la tarea fue cancelada explicitamente.
+                   No enmascara errores reales: solo CancelledError es absorbido.
 
-        if self._nav_task is not None and not self._nav_task.done():  # STEP 1
+        STEP 1: Verificar que _nav_task no es None y no ha terminado; no-op si la tarea ya concluyo
+        STEP 2: Invocar cancel() y await absorbiendo CancelledError
+        STEP 3: Asignar _nav_task = None independientemente del resultado del await
+        """
+        if self._nav_task is not None and not self._nav_task.done():
             self._nav_task.cancel()
             try:
                 await self._nav_task
             except asyncio.CancelledError:
-                pass  # STEP 2: CancelledError esperado
-        self._nav_task = None  # STEP 3
+                pass
+        self._nav_task = None
 
     async def _cancel_odometry_task_safe(self) -> None:
-        # @TASK: Cancelar _odometry_task de forma segura sin propagar CancelledError
-        # @INPUT: Sin parametros
-        # @OUTPUT: _odometry_task cancelada y awaited; referencia limpiada
-        # @CONTEXT: Utilitario invocado desde on_enter_emergency
-        # STEP 1: Verificar tarea activa
-        # STEP 2: Cancelar y absorber CancelledError
-        # STEP 3: Limpiar referencia
-        # @SECURITY: Idem a _cancel_nav_task_safe; CancelledError es el mecanismo de terminacion normal
-        # @AI_CONTEXT: Separado de _cancel_nav_task_safe para claridad de proposito en on_enter_emergency
+        """
+        @TASK: Cancelar _odometry_task de forma segura sin propagar CancelledError al caller
+        @INPUT: Sin parametros; opera sobre el atributo de instancia _odometry_task
+        @OUTPUT: _odometry_task.cancel() invocado; tarea awaited; _odometry_task = None para estado limpio
+        @CONTEXT: Utilitario invocado exclusivamente desde on_enter_emergency.
+                  Separado de _cancel_nav_task_safe para claridad de proposito en la secuencia de emergencia.
+        @SECURITY: CancelledError es el mecanismo de terminacion normal de _odometry_injection_loop;
+                   su absorcion aqui es intencional y no enmascara errores reales.
 
-        if self._odometry_task is not None and not self._odometry_task.done():  # STEP 1
+        STEP 1: Verificar que _odometry_task no es None y no ha terminado; no-op si ya concluyo
+        STEP 2: Invocar cancel() y await absorbiendo CancelledError
+        STEP 3: Asignar _odometry_task = None independientemente del resultado del await
+        """
+        if self._odometry_task is not None and not self._odometry_task.done():
             self._odometry_task.cancel()
             try:
                 await self._odometry_task
             except asyncio.CancelledError:
-                pass  # STEP 2
-        self._odometry_task = None  # STEP 3
+                pass
+        self._odometry_task = None
 
     def _resolve_logical_waypoint_id(self) -> str:
+        """
+        @TASK: Obtener el id logico del waypoint actualmente activo segun el indice del contexto
+        @INPUT: Sin parametros; lee _context.current_waypoint_index internamente
+        @OUTPUT: String con id logico del waypoint activo ("I", "1", "2", "3", "F")
+        @CONTEXT: Alias delegador a _resolve_logical_waypoint_id_by_index con el indice actual.
+                  Usado en callbacks de estado para identificar el nodo logico en eventos de auditoria.
+        """
         index = self._context.current_waypoint_index
         return self._resolve_logical_waypoint_id_by_index(index)
 
     def _resolve_logical_waypoint_id_by_index(self, index: int) -> str:
+        """
+        @TASK: Mapear un indice numerico de waypoint a su identificador logico canonico del tour
+        @INPUT: index — indice entero del waypoint en el plan (0-based)
+        @OUTPUT: String con id logico del punto de interes ("I", "1", "2", "3", "F");
+                 "I" para index < 0 y "F" para index fuera del rango de la lista
+        @CONTEXT: Los ids logicos corresponden a los puntos de interes del guion del tour universitario.
+                  Usan como clave para consultar ConversationManager y para eventos de auditoria JSON.
+        """
         logical_ids = ["I", "1", "2", "3", "F"]
         if index < 0:
             return "I"
@@ -779,8 +864,16 @@ class TourOrchestrator(StateMachine):
         logical_waypoint_id: str,
         fallback_waypoint: NavWaypoint,
     ) -> NavWaypoint:
-        robot_mode = os.environ.get("ROBOT_MODE", "").strip().lower()
-        if robot_mode != ROBOT_MODE_REAL:
+        """
+        @TASK: Resolver el NavWaypoint de destino real usando la pose calibrada del guion o el fallback
+        @INPUT: logical_waypoint_id — id logico del waypoint activo ("I", "1", "2", "3", "F")
+                fallback_waypoint — NavWaypoint de fallback proveniente del TourPlan original
+        @OUTPUT: NavWaypoint con coordenadas reales del guion si _robot_mode == "real" y pose disponible;
+                 fallback_waypoint en modo mock/sim o si ConversationManager no tiene pose para el id
+        @CONTEXT: En modo "real" consulta ConversationManager.get_waypoint_pose_2d() para la pose
+                  calibrada del mapa real. En otros modos usa el waypoint del plan directamente.
+        """
+        if self._robot_mode != ROBOT_MODE_REAL:
             return fallback_waypoint
         pose_getter = getattr(self._conversation_manager, "get_waypoint_pose_2d", None)
         if not callable(pose_getter):
@@ -801,21 +894,32 @@ class TourOrchestrator(StateMachine):
     # ------------------------------------------------------------------
 
     async def handle_user_question(self, user_text: str) -> ConversationResponse:
-        # @TASK: Dispatch de pregunta de texto al ConversationManager como alias de compatibilidad
-        # @INPUT: user_text — texto ya transcripto por el caller
-        # @OUTPUT: ConversationResponse desde la estrategia activa (local o cloud)
-        # @CONTEXT: Conservado para compatibilidad con llamadas directas desde APIServer
-        # STEP 1: Construir ConversationRequest y delegar a respond() del manager
-        # STEP 2: Guardar respuesta en contexto para trazabilidad
-        # @SECURITY: No ejecuta STT; el caller es responsable de la transcripcion previa
-        # @AI_CONTEXT: prefer process_interaction() si hay audio disponible
+        """
+        @TASK: Despachar una pregunta de texto al ConversationManager como alias de compatibilidad
+        @INPUT: user_text — texto ya transcripto por el caller; sin ejecucion de STT en este metodo
+        @OUTPUT: ConversationResponse desde la estrategia activa (local o cloud);
+                 _context.last_interaction actualizado para trazabilidad de la sesion
+        @CONTEXT: Conservado para compatibilidad con el endpoint POST /question del APIServer.
+                  Preferir process_interaction() cuando hay audio PCM disponible (incluye STT completo).
+        @SECURITY: No ejecuta STT; el caller es responsable de la validacion y saneado del texto.
 
-        request = ConversationRequest(user_text=user_text)      # STEP 1
+        STEP 1: Construir ConversationRequest con user_text y delegar a conversation_manager.respond()
+        STEP 2: Guardar la respuesta en _context.last_interaction para trazabilidad de la sesion activa
+        """
+        request = ConversationRequest(user_text=user_text)
         response = await self._conversation_manager.respond(request)
-        self._context.last_interaction = response                # STEP 2
+        self._context.last_interaction = response
         return response
 
     async def build_telemetry_payload(self) -> dict[str, Any]:
+        """
+        @TASK: Construir el payload de telemetria con el estado actual del sistema para broadcast WebSocket
+        @INPUT: Sin parametros; lee state_id, _context y llama a _read_battery_level() internamente
+        @OUTPUT: dict con claves: timestamp (ISO UTC), fsm_state (uppercase), current_waypoint_id,
+                 battery_level (float 0-100 o fallback 100.0)
+        @CONTEXT: Invocado por _broadcast_telemetry_state() y por websocket_telemetry para snapshot inicial.
+                  battery_level se obtiene con timeout de 0.2 s para no bloquear el broadcast.
+        """
         battery_level = await self._read_battery_level()
         if self._context.waypoint_plan:
             waypoint_id = self._resolve_logical_waypoint_id()
@@ -829,6 +933,14 @@ class TourOrchestrator(StateMachine):
         }
 
     def _schedule_telemetry_broadcast(self) -> None:
+        """
+        @TASK: Programar un broadcast de telemetria asíncronico como asyncio.Task fire-and-forget
+        @INPUT: Sin parametros; usa _telemetry_manager internamente
+        @OUTPUT: asyncio.Task "telemetry-broadcast-{state_id}" creada y registrada con done_callback;
+                 no-op si _telemetry_manager es None (telemetria desactivada)
+        @CONTEXT: Invocado desde todos los callbacks on_enter_* para notificar cambios de estado FSM.
+                  Errores de broadcast se absorben silenciosamente via _handle_telemetry_result.
+        """
         if self._telemetry_manager is None:
             return
         task = asyncio.create_task(
@@ -838,12 +950,28 @@ class TourOrchestrator(StateMachine):
         task.add_done_callback(self._handle_telemetry_result)
 
     async def _broadcast_telemetry_state(self) -> None:
+        """
+        @TASK: Construir y enviar el payload de telemetria a todos los clientes WebSocket suscritos
+        @INPUT: Sin parametros; delega en build_telemetry_payload() y _telemetry_manager.broadcast()
+        @OUTPUT: Payload JSON enviado a todos los WebSockets activos en el pool del TelemetryManager;
+                 no-op si _telemetry_manager es None
+        @CONTEXT: Corrutina invocada como Task desde _schedule_telemetry_broadcast (fire-and-forget).
+        """
         if self._telemetry_manager is None:
             return
         payload = await self.build_telemetry_payload()
         await self._telemetry_manager.broadcast(payload)
 
     async def _read_battery_level(self) -> Any:
+        """
+        @TASK: Leer el nivel de bateria del hardware con timeout estricto y fallback seguro a 100.0
+        @INPUT: Sin parametros; accede a _hardware_api.get_state() si el metodo esta disponible
+        @OUTPUT: Valor numerico del nivel de bateria (float 0-100); 100.0 como fallback ante
+                 timeout, excepcion o adaptador sin soporte para get_state()
+        @CONTEXT: Invocado por build_telemetry_payload(); compatible con adaptadores real/mock/sim.
+                  Fallback a 100.0 evita alertas falsas de bateria baja ante adaptadores sin soporte.
+        @SECURITY: asyncio.wait_for con timeout 0.2 s previene bloqueo del broadcast de telemetria.
+        """
         state_reader = getattr(self._hardware_api, "get_state", None)
         if callable(state_reader):
             try:
@@ -858,6 +986,13 @@ class TourOrchestrator(StateMachine):
 
     @staticmethod
     def _handle_telemetry_result(task: asyncio.Task[None]) -> None:
+        """
+        @TASK: Absorber silenciosamente excepciones de la tarea de broadcast de telemetria
+        @INPUT: task — asyncio.Task completada (exito o fallo) de _broadcast_telemetry_state
+        @OUTPUT: LOGGER.warning si la tarea fallo; sin re-propagacion de excepciones al caller
+        @CONTEXT: done_callback registrado en _schedule_telemetry_broadcast; invocado por asyncio
+                  automaticamente cuando la tarea termina. Un fallo de telemetria no es critico para el tour.
+        """
         try:
             task.result()
         except Exception as exc:
@@ -870,6 +1005,16 @@ class TourOrchestrator(StateMachine):
         node_id: str,
         payload: dict[str, Any],
     ) -> None:
+        """
+        @TASK: Programar la persistencia de un evento de auditoria como asyncio.Task fire-and-forget
+        @INPUT: event_type — tipo del evento (debe pertenecer a MissionAuditLogger._ALLOWED_EVENTS)
+                node_id — identificador logico del waypoint o nodo activo en el momento del evento
+                payload — dict con datos adicionales especificos del tipo de evento
+        @OUTPUT: asyncio.Task "audit-{event_type.lower()}" creada y registrada con done_callback;
+                 no-op si _mission_audit_logger es None (auditoria desactivada)
+        @CONTEXT: Invocado desde dispatch_tour, on_enter_interacting, on_enter_emergency y
+                  _navigation_loop. Errores de persistencia se absorben via _handle_audit_result.
+        """
         if self._mission_audit_logger is None:
             return
         task = asyncio.create_task(
@@ -880,6 +1025,13 @@ class TourOrchestrator(StateMachine):
 
     @staticmethod
     def _handle_audit_result(task: asyncio.Task[None]) -> None:
+        """
+        @TASK: Absorber silenciosamente excepciones de la tarea de persistencia de auditoria
+        @INPUT: task — asyncio.Task completada (exito o fallo) de MissionAuditLogger.log_event
+        @OUTPUT: LOGGER.warning si la tarea fallo; sin re-propagacion de excepciones al caller
+        @CONTEXT: done_callback registrado en _schedule_audit_event; invocado por asyncio automaticamente.
+                  Un fallo de auditoria no es critico para la operacion del tour en curso.
+        """
         try:
             task.result()
         except Exception as exc:

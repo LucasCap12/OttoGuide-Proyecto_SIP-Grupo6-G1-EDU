@@ -1,16 +1,19 @@
-from __future__ import annotations
+"""
+@TASK: Implementar UnitreeG1Adapter como adaptador real de hardware
+@INPUT: Interfaz RobotHardwareInterface; SDK unitree_sdk2py importado localmente
+@OUTPUT: Adaptador funcional para control DDS del Unitree G1 EDU 8
+@CONTEXT: Unico archivo que importa unitree_sdk2py en todo el proyecto
+@SECURITY: Clamping cinematico obligatorio; damp() con timeout 1.5s
 
-# @TASK: Implementar UnitreeG1Adapter como adaptador real de hardware
-# @INPUT: Interfaz RobotHardwareInterface; SDK unitree_sdk2py importado localmente
-# @OUTPUT: Adaptador funcional para control DDS del Unitree G1 EDU 8
-# @CONTEXT: Unico archivo que importa unitree_sdk2py en todo el proyecto
-# @SECURITY: Clamping cinematico obligatorio; damp() con timeout 1.5s
-# STEP 1: Import lazy de unitree_sdk2py solo dentro de metodos
-# STEP 2: ChannelFactoryInitialize(id=0, networkInterface=None) — firma auditada en
-#         libs/unitree_sdk2_python-master/unitree_sdk2py/core/channel.py:298
-#         Sintaxis correcta: ChannelFactoryInitialize(domain_id, network_interface_str)
-# STEP 3: Clamping linear_x [-0.3, 0.3], angular_z [-0.5, 0.5]
-# STEP 4: damp() con asyncio.wait_for timeout=1.5s
+STEP 1: Import lazy de unitree_sdk2py solo dentro de metodos
+STEP 2: ChannelFactoryInitialize(id=0, networkInterface=None) — firma auditada en
+    libs/unitree_sdk2_python-master/unitree_sdk2py/core/channel.py:298
+    Sintaxis correcta: ChannelFactoryInitialize(domain_id, network_interface_str)
+STEP 3: Clamping linear_x [-0.3, 0.3], angular_z [-0.5, 0.5]
+STEP 4: damp() con asyncio.wait_for timeout=1.5s
+"""
+
+from __future__ import annotations
 # AUDIT RESULT — ChannelFactoryInitialize: contrato VALIDO (firm signature confirmada)
 # AUDIT RESULT — Move(vx, vy, vyaw, continous_move=False): contrato VALIDO
 # AUDIT RESULT — stand() CORREGIDO: SetFsmId(1)=Damp; Start()=SetFsmId(200) para bipedestacion
@@ -48,11 +51,13 @@ class UnitreeG1Adapter(RobotHardwareInterface):
     """
 
     def __init__(self) -> None:
-        # @TASK: Inicializar estado interno sin contactar el SDK
-        # @INPUT: Sin parametros
-        # @OUTPUT: Estado _initialized=False; SDK no cargado
-        # @CONTEXT: Constructor ligero; la inicializacion real ocurre en initialize()
-        # @SECURITY: No se toca el SDK hasta que initialize() sea invocado
+        """
+        @TASK: Inicializar estado interno sin contactar el SDK
+        @INPUT: Sin parametros
+        @OUTPUT: Estado _initialized=False; SDK no cargado
+        @CONTEXT: Constructor ligero; la inicializacion real ocurre en initialize()
+        @SECURITY: No se toca el SDK hasta que initialize() sea invocado
+        """
         self._sdk_client: Optional[Any] = None
         self._executor: Optional[ThreadPoolExecutor] = None
         self._initialized: bool = False
@@ -77,7 +82,6 @@ class UnitreeG1Adapter(RobotHardwareInterface):
             LOGGER.warning("[REAL] initialize() invocado en adaptador ya inicializado.")
             return
 
-        # STEP 1: Import lazy del SDK — unico punto de importacion en el proyecto
         try:
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
             from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
@@ -87,7 +91,6 @@ class UnitreeG1Adapter(RobotHardwareInterface):
                 "Instalar con: pip install 'otto-guide[hardware]'"
             ) from exc
 
-        # STEP 2: Crear executor dedicado y negociar DDS
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="unitree-sdk2",
@@ -106,7 +109,6 @@ class UnitreeG1Adapter(RobotHardwareInterface):
                 f"ChannelFactoryInitialize(0) fallo: {exc}"
             ) from exc
 
-        # STEP 3: Instanciar LocoClient
         client = LocoClient()
 
         try:
@@ -172,11 +174,9 @@ class UnitreeG1Adapter(RobotHardwareInterface):
         """
         self._assert_initialized()
 
-        # STEP 1: Clamping cinematico
         clamped_vx = max(-_MAX_LINEAR_X, min(_MAX_LINEAR_X, command.linear_x))
         clamped_wz = max(-_MAX_ANGULAR_Z, min(_MAX_ANGULAR_Z, command.angular_z))
 
-        # STEP 2: Despachar al SDK
         try:
             await self._invoke_sdk("Move", clamped_vx, 0.0, clamped_wz)
         except Exception as exc:
@@ -184,7 +184,6 @@ class UnitreeG1Adapter(RobotHardwareInterface):
             await self.damp()
             raise RuntimeError(f"Fallo en Move; Damp() ejecutado: {exc}") from exc
 
-        # STEP 3: Esperar duracion del comando
         if command.duration_ms > 0:
             await asyncio.sleep(command.duration_ms / 1000.0)
 

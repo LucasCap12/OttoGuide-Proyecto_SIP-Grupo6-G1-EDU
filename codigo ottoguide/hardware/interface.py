@@ -1,13 +1,16 @@
-from __future__ import annotations
+"""
+@TASK: Definir ABC RobotHardwareInterface y dataclass MotionCommand
+@INPUT: Sin dependencias externas — cero imports de unitree_sdk2py
+@OUTPUT: Contrato de interfaz para todos los adaptadores de hardware
+@CONTEXT: Capa de abstraccion HIL/SITL; desacopla orquestador de SDK fisico
+@SECURITY: frozen=True en MotionCommand previene mutacion post-construccion
 
-# @TASK: Definir ABC RobotHardwareInterface y dataclass MotionCommand
-# @INPUT: Sin dependencias externas — cero imports de unitree_sdk2py
-# @OUTPUT: Contrato de interfaz para todos los adaptadores de hardware
-# @CONTEXT: Capa de abstraccion HIL/SITL; desacopla orquestador de SDK fisico
-# @SECURITY: frozen=True en MotionCommand previene mutacion post-construccion
-# STEP 1: Definir MotionCommand como dataclass inmutable
-# STEP 2: Definir ABC con metodos obligatorios para cualquier adaptador
-# STEP 3: damp() debe ser invocable con timeout de 1.5s por el caller
+STEP 1: Definir MotionCommand como dataclass inmutable
+STEP 2: Definir ABC con metodos obligatorios para cualquier adaptador
+STEP 3: damp() debe ser invocable con timeout de 1.5s por el caller
+"""
+
+from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
