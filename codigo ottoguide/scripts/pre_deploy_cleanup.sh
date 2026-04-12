@@ -1,35 +1,33 @@
 #!/usr/bin/env bash
-
-: <<'DOC'
-@TASK: Sanitizar entorno local antes de despliegue.
-@INPUT: Arbol de codigo en la raiz de codigo ottoguide.
-@OUTPUT: Cache Python eliminada y logs vaciados con .gitkeep preservado.
-@CONTEXT: Paso previo obligatorio antes de deploy_to_companion.sh.
-@SECURITY: Finaliza en codigo 1 ante cualquier error de filesystem.
-STEP [1]: Resolver ruta absoluta del proyecto.
-STEP [2]: Eliminar directorios __pycache__ y archivos .pyc.
-STEP [3]: Vaciar logs y regenerar logs/.gitkeep.
-STEP [4]: Retornar codigo 0 en exito.
-DOC
+# @TASK: Ejecutar limpieza local previa al corte de release RC1.
+# @INPUT: Arbol del repositorio local en codigo ottoguide.
+# @OUTPUT: Cachés Python, logs locales y artefactos de build residuales eliminados.
+# @CONTEXT: Paso 1 del RUNBOOK_STARTUP_RC1 y RUNBOOK_DEPLOY (Preparacion de Release).
+# @SECURITY: Ejecucion fail-fast; cualquier error de filesystem aborta el proceso.
+# STEP 1: Resolver PROJECT_ROOT y validar existencia.
+# STEP 2: Eliminar __pycache__, .pytest_cache y archivos Python temporales.
+# STEP 3: Eliminar logs locales antiguos logs/*.json y logs/*.log.
+# STEP 4: Eliminar artefactos residuales de build (build, dist, *.egg-info).
 
 set -e
-trap 'exit 1' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-LOGS_DIR="${PROJECT_ROOT}/logs"
 
-if [ ! -d "${PROJECT_ROOT}" ]; then
-  echo "@OUTPUT: ERROR ruta de proyecto no disponible: ${PROJECT_ROOT}"
+if [[ ! -d "${PROJECT_ROOT}" ]]; then
+  echo "[ERROR] PROJECT_ROOT invalido: ${PROJECT_ROOT}" >&2
   exit 1
 fi
 
 find "${PROJECT_ROOT}" -type d -name "__pycache__" -prune -exec rm -rf {} +
-find "${PROJECT_ROOT}" -type f -name "*.pyc" -delete
+find "${PROJECT_ROOT}" -type d -name ".pytest_cache" -prune -exec rm -rf {} +
+find "${PROJECT_ROOT}" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
 
-mkdir -p "${LOGS_DIR}"
-find "${LOGS_DIR}" -mindepth 1 -exec rm -rf {} +
-: > "${LOGS_DIR}/.gitkeep"
+mkdir -p "${PROJECT_ROOT}/logs"
+find "${PROJECT_ROOT}/logs" -maxdepth 1 -type f \( -name "*.json" -o -name "*.log" \) -delete
 
-echo "@OUTPUT: Sanitizacion completada en ${PROJECT_ROOT}"
+rm -rf "${PROJECT_ROOT}/build" "${PROJECT_ROOT}/dist"
+find "${PROJECT_ROOT}" -maxdepth 1 -type d -name "*.egg-info" -prune -exec rm -rf {} +
+
+echo "[INFO] pre_deploy_cleanup completado"
 exit 0

@@ -1,0 +1,24 @@
+# @TASK: Definir unidad systemd persistente para orquestacion OttoGuide HIL.
+# @INPUT: Script de arranque /opt/ottoguide/scripts/mvp_master_run.sh y usuario unitree.
+# @OUTPUT: Servicio de tipo simple con reinicio automatico on-failure.
+# @CONTEXT: Paso 4 del RUNBOOK_DEPLOY para operacion persistente en Companion PC.
+# @SECURITY: Ejecuta con User=unitree y directorio de trabajo acotado a /opt/ottoguide.
+# STEP 1: Declarar metadata de unidad y dependencia de red.
+# STEP 2: Configurar identidad de ejecucion y comando de arranque.
+# STEP 3: Configurar politicas de restart y target multi-user.
+
+[Unit]
+Description=OttoGuide MVP HIL Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/opt/ottoguide
+ExecStart=/bin/bash /opt/ottoguide/scripts/mvp_master_run.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

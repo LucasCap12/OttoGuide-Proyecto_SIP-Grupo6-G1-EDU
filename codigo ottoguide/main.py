@@ -163,7 +163,10 @@ def _get_conversation_manager_stub(settings):
         from src.interaction import ConversationManager, CloudNLPPipeline, LocalNLPPipeline
         return ConversationManager(
             cloud_strategy=CloudNLPPipeline(timeout_s=1.0),
-            local_strategy=LocalNLPPipeline(model_name="ollama-local"),
+            local_strategy=LocalNLPPipeline(
+                model_name=settings.OLLAMA_MODEL,
+                ollama_base_url=settings.OLLAMA_HOST,
+            ),
         )
     except Exception:
         LOGGER.warning(

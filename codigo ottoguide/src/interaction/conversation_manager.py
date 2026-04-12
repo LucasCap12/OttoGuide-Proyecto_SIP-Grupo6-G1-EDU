@@ -65,7 +65,7 @@ GEMINI_CHAT_URL_TMPL: str = (
 )
 
 _DEFAULT_OLLAMA_BASE_URL: str = "http://localhost:11434"
-_DEFAULT_OLLAMA_MODEL: str    = "llama3:8b-instruct-q4_K_M"
+_DEFAULT_OLLAMA_MODEL: str    = "qwen2.5:3b"
 _DEFAULT_CLOUD_PROVIDER: str  = "openai"
 
 LOGGER = logging.getLogger(__name__)
@@ -1213,66 +1213,67 @@ class ConversationManager:
 
     async def start_interactive_session(self, waypoint_id: str) -> ConversationResponse:
         """
-        @TASK: Ejecutar sesion interactiva completa con STT/TTS via AudioHardwareBridge y LLM
-        @INPUT: waypoint_id — identificador de la zona activa para contextualizar el system_prompt
-        @OUTPUT: ConversationResponse con respuesta del LLM reproducida por TTS via audio_bridge;
-                 ConversationResponse de fallback seguro si falla STT, LLM o el audio bridge
+        @TASK: Ejecutar sesion interactiva completa Mic -> STT local -> LLM local -> TTS local
+        @INPUT: waypoint_id — identificador de la zona activa para contextualizar el prompt de zona
+        @OUTPUT: ConversationResponse local; fallback seguro si falla captura de microfono o pipeline local
         @CONTEXT: Invocado por process_interaction() cuando interaction_type="llm_qa".
-                  Usa AudioHardwareBridge.listen_stt() y speak_tts() integrados en hardware.
-                  Ante cualquier excepcion no controlada, retorna fallback sin propagar al orquestador.
-        @SECURITY: Sin persistencia de audio ni texto del usuario en disco en ningun momento.
-                   Las excepciones de hardware de audio se absorben retornando fallback seguro para
-                   garantizar la estabilidad de la FSM y evitar trigger_emergency innecesarios.
+                  Captura PCM con AudioHardwareBridge, STT con LocalNLPPipeline.transcribe(),
+                  inferencia Ollama local + TTS local con LocalNLPPipeline.generate().
+        @SECURITY: Audio y texto se procesan en memoria local; sin STT cloud ni salida de datos fuera del host.
 
-        STEP 1: Activar zona con set_active_zone para cargar system_prompt en cache (_current_waypoint_prompt)
-        STEP 2: Capturar input de voz via audio_bridge.listen_stt(); retornar fallback si vacio o error
-        STEP 3: Construir composed_prompt con system_prompt y enviar a llm_client.generate_response()
-        STEP 4: Reproducir respuesta via audio_bridge.speak_tts() y retornar ConversationResponse
+        STEP 1: Activar zona y capturar PCM local desde microfono mediante audio_bridge.listen_pcm()
+        STEP 2: Transcribir PCM con _local.transcribe() y construir prompt zoneado via _build_zoned_text()
+        STEP 3: Ejecutar _local.generate() para LLM local + TTS local sin bloquear el event loop
+        STEP 4: En error, reproducir fallback seguro via _local.synthesize_and_play() y retornar respuesta segura
         """
         try:
             self.set_active_zone(waypoint_id)
         except Exception:
             pass
-        system_prompt = self._current_waypoint_prompt.strip()
+
         try:
-            user_input = await self._audio_bridge.listen_stt()
-            if not user_input:
+            audio_pcm = await self._audio_bridge.listen_pcm()
+            if audio_pcm.size == 0:
                 message = "No detecte entrada de voz. Retornando a estado seguro."
-                await self._audio_bridge.speak_tts(message)
+                await self._local.synthesize_and_play(message)
                 return ConversationResponse(
                     answer_text=message,
-                    source_pipeline="llm_qa",
+                    source_pipeline="local",
                     audio_stream_ready=True,
                 )
-            composed_prompt = (
-                f"Contexto base: {system_prompt}\n"
-                f"Pregunta del usuario: {user_input}\n"
-                "Responde de manera concisa y tecnica:"
+
+            user_input = await asyncio.wait_for(
+                self._local.transcribe(audio_pcm, language="es"),
+                timeout=STT_TIMEOUT_S,
             )
-            llm_response = await self._llm_client.generate_response(composed_prompt)
-            if not llm_response:
+            if not user_input.strip():
                 fallback = "Error de procesamiento de hardware. Retornando a estado seguro."
-                await self._audio_bridge.speak_tts(fallback)
+                await self._local.synthesize_and_play(fallback)
                 return ConversationResponse(
                     answer_text=fallback,
-                    source_pipeline="llm_qa",
+                    source_pipeline="local",
                     audio_stream_ready=True,
                 )
-            await self._audio_bridge.speak_tts(llm_response)
-            return ConversationResponse(
-                answer_text=llm_response,
-                source_pipeline="llm_qa",
-                audio_stream_ready=True,
+
+            request = ConversationRequest(
+                user_text=self._build_zoned_text(user_input),
+                locale="es",
             )
+            response = await asyncio.wait_for(
+                self._local.generate(request),
+                timeout=LLM_LOCAL_TIMEOUT_S + TTS_TIMEOUT_S,
+            )
+            self._active_pipeline = "local"
+            return response
         except Exception:
             fallback = "Error de procesamiento de hardware. Retornando a estado seguro."
             try:
-                await self._audio_bridge.speak_tts(fallback)
+                await self._local.synthesize_and_play(fallback)
             except Exception:
                 pass
             return ConversationResponse(
                 answer_text=fallback,
-                source_pipeline="llm_qa",
+                source_pipeline="local",
                 audio_stream_ready=False,
             )
 

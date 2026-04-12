@@ -557,26 +557,41 @@ class TourOrchestrator(StateMachine):
         @SECURITY: Damp() es el PRIMER comando de hardware ejecutado (STEP 3); ninguna otra operacion
                    de hardware precede a Damp() para garantizar la caida segura ante cualquier estado.
 
-        STEP 1: Cancelar _nav_task y _odometry_task via _cancel_*_safe() sin propagar excepciones
-        STEP 2: Enviar cancel_navigation() al Nav2Bridge con timeout de 1.0 s
-        STEP 3: Invocar Damp() en hardware con timeout _damp_timeout_s (primera accion de hardware)
-        STEP 4: Enviar MotionCommand de velocidad cero como redundancia cinematica tras Damp()
-        STEP 5: Invocar VisionProcessor.close() para liberar el bus USB y el thread de captura
-        STEP 6: Registrar estado final del sistema via LOGGER.critical para diagnostico post-mortem
+        STEP 1: Persistir evento EMERGENCY_TRIGGERED en MissionAuditLogger con await directo
+        STEP 2: Cancelar _nav_task y _odometry_task via _cancel_*_safe() sin propagar excepciones
+        STEP 3: Enviar cancel_navigation() al Nav2Bridge con timeout de 1.0 s
+        STEP 4: Invocar Damp() en hardware con timeout _damp_timeout_s (primera accion de hardware)
+        STEP 5: Enviar MotionCommand de velocidad cero como redundancia cinematica tras Damp()
+        STEP 6: Invocar VisionProcessor.close() para liberar el bus USB y el thread de captura
+        STEP 7: Registrar estado final del sistema via LOGGER.critical para diagnostico post-mortem
         """
         LOGGER.critical(
             "[Orchestrator] EMERGENCY activado. Causa: %s",
             self._context.last_error,
         )
         self._schedule_telemetry_broadcast()
-        self._schedule_audit_event(
-            event_type="EMERGENCY_TRIGGERED",
-            node_id=self._resolve_logical_waypoint_id(),
-            payload={
-                "reason": self._context.last_error or "unknown",
-                "state": self.state_id,
-            },
-        )
+
+        emergency_node_id = self._resolve_logical_waypoint_id()
+        emergency_payload = {
+            "reason": self._context.last_error or "unknown",
+            "state": self.state_id,
+        }
+
+        if self._mission_audit_logger is not None:
+            try:
+                await self._mission_audit_logger.log_event(
+                    event_type="EMERGENCY_TRIGGERED",
+                    node_id=emergency_node_id,
+                    payload=emergency_payload,
+                )
+            except Exception as exc:
+                LOGGER.error(
+                    "[Orchestrator] Fallo al persistir auditoria EMERGENCY: %s", exc
+                )
+        else:
+            LOGGER.warning(
+                "[Orchestrator] MissionAuditLogger no configurado; EMERGENCY sin persistencia de auditoria."
+            )
 
         await self._cancel_nav_task_safe()
         await self._cancel_odometry_task_safe()
@@ -916,7 +931,7 @@ class TourOrchestrator(StateMachine):
         @TASK: Construir el payload de telemetria con el estado actual del sistema para broadcast WebSocket
         @INPUT: Sin parametros; lee state_id, _context y llama a _read_battery_level() internamente
         @OUTPUT: dict con claves: timestamp (ISO UTC), fsm_state (uppercase), current_waypoint_id,
-                 battery_level (float 0-100 o fallback 100.0)
+                 battery_level (float 0-100 o fallback 100.0), nlp_intent y nlp_source_pipeline
         @CONTEXT: Invocado por _broadcast_telemetry_state() y por websocket_telemetry para snapshot inicial.
                   battery_level se obtiene con timeout de 0.2 s para no bloquear el broadcast.
         """
@@ -925,11 +940,30 @@ class TourOrchestrator(StateMachine):
             waypoint_id = self._resolve_logical_waypoint_id()
         else:
             waypoint_id = "N/A"
+
+        nlp_intent = "UNKNOWN"
+        intent_getter = getattr(self._conversation_manager, "get_waypoint_interaction_type", None)
+        if callable(intent_getter) and waypoint_id != "N/A":
+            try:
+                nlp_intent = str(intent_getter(waypoint_id)).upper()
+            except Exception:
+                nlp_intent = "UNKNOWN"
+
+        last_interaction = self._context.last_interaction
+        nlp_source_pipeline = "N/A"
+        nlp_answer_preview = ""
+        if last_interaction is not None:
+            nlp_source_pipeline = str(getattr(last_interaction, "source_pipeline", "N/A")).upper()
+            nlp_answer_preview = str(getattr(last_interaction, "answer_text", ""))[:180]
+
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "fsm_state": self.state_id.upper(),
             "current_waypoint_id": waypoint_id,
             "battery_level": battery_level,
+            "nlp_intent": nlp_intent,
+            "nlp_source_pipeline": nlp_source_pipeline,
+            "nlp_answer_preview": nlp_answer_preview,
         }
 
     def _schedule_telemetry_broadcast(self) -> None:

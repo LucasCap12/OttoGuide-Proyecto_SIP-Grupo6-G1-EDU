@@ -288,8 +288,17 @@
             <span class="metric-label">Timestamp</span>
             <div id="timestamp" class="metric-value">N/A</div>
           </div>
+          <div class="metric">
+            <span class="metric-label">Intent NLP</span>
+            <div id="nlpIntent" class="metric-value warn">UNKNOWN</div>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Pipeline NLP</span>
+            <div id="nlpPipeline" class="metric-value">N/A</div>
+          </div>
         </div>
         <pre id="telemetryLog" class="log">Esperando telemetría...</pre>
+        <pre id="intentLog" class="log">Esperando intenciones NLP...</pre>
       </article>
 
       <aside class="panel control-wrap">
@@ -304,12 +313,20 @@
   </main>
 
   <script>
+    // @TASK: Inicializar referencias del dashboard de telemetria y control.
+    // @INPUT: DOM renderizado de dashboard.html.
+    // @OUTPUT: Referencias activas para render en tiempo real y control de emergencia.
+    // @CONTEXT: Cliente SPA Vanilla JS para operacion HIL RC1.
+    // @SECURITY: Solo acceso a nodos locales del DOM; sin evaluacion dinamica.
     const telemetryLog = document.getElementById("telemetryLog");
+    const intentLog = document.getElementById("intentLog");
     const controlLog = document.getElementById("controlLog");
     const fsmState = document.getElementById("fsmState");
     const currentWaypoint = document.getElementById("currentWaypoint");
     const batteryLevel = document.getElementById("batteryLevel");
     const timestamp = document.getElementById("timestamp");
+    const nlpIntent = document.getElementById("nlpIntent");
+    const nlpPipeline = document.getElementById("nlpPipeline");
     const emergencyBtn = document.getElementById("emergencyBtn");
     const connectionDot = document.getElementById("connectionDot");
     const connectionText = document.getElementById("connectionText");
@@ -317,19 +334,33 @@
     let socket = null;
     let reconnectTimer = null;
     let reconnectDelay = 1000;
-    let emergencyEngaged = false;
 
+    // @TASK: Acumular linea de log en panel objetivo preservando scroll al final.
+    // @INPUT: target (pre), message (string).
+    // @OUTPUT: Texto agregado en bloque de log.
+    // @CONTEXT: Reuso para logs de telemetria, intenciones y control.
+    // @SECURITY: Insercion por textContent para evitar ejecucion HTML/JS embebido.
     function appendLog(target, message) {
       const current = target.textContent.trim();
       target.textContent = current && current !== "Sin acciones ejecutadas." ? `${current}\n${message}` : message;
       target.scrollTop = target.scrollHeight;
     }
 
+    // @TASK: Reflejar estado de enlace WebSocket en el encabezado del dashboard.
+    // @INPUT: online (boolean).
+    // @OUTPUT: Indicador visual y texto de conectividad actualizados.
+    // @CONTEXT: Operacion HIL requiere visibilidad inmediata de canal de telemetria.
+    // @SECURITY: Solo mutacion de estado UI local.
     function setConnectionState(online) {
       connectionDot.classList.toggle("online", online);
       connectionText.textContent = online ? "Conectado" : "Reconectando";
     }
 
+    // @TASK: Actualizar una metrica visual con valor y tono semantico.
+    // @INPUT: element (DOM), value (string), tone (ok|warn|danger).
+    // @OUTPUT: Metrica renderizada con clase de severidad.
+    // @CONTEXT: Reuso para FSM, waypoint, bateria, timestamp e intent NLP.
+    // @SECURITY: Render por textContent para evitar inyeccion de scripts.
     function updateMetric(element, value, tone) {
       element.textContent = value;
       element.classList.remove("ok", "warn", "danger");
@@ -338,9 +369,39 @@
       }
     }
 
+    // @TASK: Renderizar telemetria recibida y registrar bitacora de intenciones NLP procesadas.
+    // @INPUT: data — payload JSON desde /ws/telemetry.
+    // @OUTPUT: UI sincronizada y log incremental de intenciones.
+    // @CONTEXT: Consumidor del stream WS de estado FSM en tiempo real.
+    // @SECURITY: Manejo defensivo de null/undefined; sin eval ni parseo inseguro.
+    function handleTelemetryPayload(data) {
+      const fsm = String(data.fsm_state ?? "UNKNOWN").toUpperCase();
+      const waypoint = String(data.current_waypoint_id ?? "N/A");
+      const battery = String(data.battery_level ?? "N/A");
+      const ts = String(data.timestamp ?? "N/A");
+      const intent = String(data.nlp_intent ?? "UNKNOWN").toUpperCase();
+      const pipeline = String(data.nlp_source_pipeline ?? "N/A").toUpperCase();
+      const preview = String(data.nlp_answer_preview ?? "");
+
+      const fsmTone = fsm === "EMERGENCY" ? "danger" : (fsm === "INTERACTING" ? "warn" : "ok");
+      updateMetric(fsmState, fsm, fsmTone);
+      updateMetric(currentWaypoint, waypoint, "warn");
+      updateMetric(batteryLevel, `${battery} %`, "ok");
+      updateMetric(timestamp, ts, "warn");
+      updateMetric(nlpIntent, intent, intent === "UNKNOWN" ? "warn" : "ok");
+      updateMetric(nlpPipeline, pipeline, "ok");
+
+      appendLog(telemetryLog, JSON.stringify(data, null, 2));
+      appendLog(intentLog, `[intent] ${ts} | fsm=${fsm} | intent=${intent} | pipeline=${pipeline} | preview=${preview}`);
+    }
+
+    // @TASK: Establecer conexion WebSocket de telemetria en puerto 8000 y gestionar reconexion.
+    // @INPUT: host actual del navegador.
+    // @OUTPUT: Socket activo a ws://[HOST]:8000/ws/telemetry con reintento exponencial.
+    // @CONTEXT: Canal principal de observabilidad para RUNBOOK_STARTUP_RC1 Paso 9.
+    // @SECURITY: Conexion saliente solo a endpoint local esperado del backend OttoGuide.
     function connectTelemetry() {
-      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-      const wsUrl = `${scheme}://${window.location.host}/ws/telemetry`;
+      const wsUrl = `ws://${window.location.hostname}:8000/ws/telemetry`;
       socket = new WebSocket(wsUrl);
 
       socket.onopen = () => {
@@ -352,11 +413,7 @@
       socket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          updateMetric(fsmState, String(data.fsm_state ?? "UNKNOWN"), "ok");
-          updateMetric(currentWaypoint, String(data.current_waypoint_id ?? "N/A"), "warn");
-          updateMetric(batteryLevel, `${String(data.battery_level ?? "N/A")} %`, "ok");
-          updateMetric(timestamp, String(data.timestamp ?? "N/A"), "warn");
-          appendLog(telemetryLog, JSON.stringify(data, null, 2));
+          handleTelemetryPayload(data);
         } catch (error) {
           appendLog(telemetryLog, `[error] telemetría inválida: ${error.message}`);
         }
@@ -377,6 +434,11 @@
       };
     }
 
+    // @TASK: Programar reintento de conexion WebSocket con backoff acotado.
+    // @INPUT: Estado de reconnectTimer/reconnectDelay.
+    // @OUTPUT: Nuevo intento de connectTelemetry() cuando expira el timer.
+    // @CONTEXT: Recuperacion automatica de observabilidad ante cortes de red locales.
+    // @SECURITY: Un solo timer concurrente para evitar tormenta de reconexiones.
     function scheduleReconnect() {
       if (reconnectTimer) {
         return;
@@ -388,6 +450,11 @@
       }, reconnectDelay);
     }
 
+    // @TASK: Disparar parada de emergencia HTTP y registrar resultado operativo.
+    // @INPUT: Click del operador sobre el boton EMERGENCY STOP.
+    // @OUTPUT: Solicitud POST a /api/emergency_stop y log de confirmacion/error.
+    // @CONTEXT: Mecanismo manual de contingencia durante operacion HIL.
+    // @SECURITY: Usa fetch same-origin; sin inyeccion de payload externo.
     async function triggerEmergencyStop() {
       emergencyBtn.disabled = true;
       emergencyBtn.classList.add("emergency-active");
@@ -407,12 +474,10 @@
         }
 
         const payload = await response.json();
-        emergencyEngaged = payload.status === "emergency_engaged";
         document.body.style.background = "linear-gradient(180deg, #2a0606 0%, #0b0f14 100%)";
         appendLog(controlLog, `[control] respuesta: ${JSON.stringify(payload)}`);
         appendLog(controlLog, "[control] parada de emergencia activada.");
       } catch (error) {
-        emergencyEngaged = false;
         emergencyBtn.classList.remove("emergency-active");
         appendLog(controlLog, `[control] fallo en emergency stop: ${error.message}`);
       } finally {
@@ -420,6 +485,11 @@
       }
     }
 
+    // @TASK: Enlazar acciones de UI y limpiar recursos al cerrar pagina.
+    // @INPUT: Eventos click y beforeunload del navegador.
+    // @OUTPUT: Handlers activos y cierre limpio de socket/timers.
+    // @CONTEXT: Cierre ordenado del cliente de observabilidad HIL.
+    // @SECURITY: Evita sockets colgantes y reconexiones fantasma al abandonar la vista.
     emergencyBtn.addEventListener("click", triggerEmergencyStop);
 
     window.addEventListener("beforeunload", () => {

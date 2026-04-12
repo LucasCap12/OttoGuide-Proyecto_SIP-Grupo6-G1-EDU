@@ -1,51 +1,35 @@
 #!/usr/bin/env bash
-
-: <<'DOC'
-@TASK: Congelar dependencias productivas del entorno Python activo.
-@INPUT: Entorno virtual ya activado y pip disponible.
-@OUTPUT: Archivo requirements_prod.txt con versiones exactas compatibles con Ubuntu.
-@CONTEXT: Paso de code freeze para Release Candidate.
-@SECURITY: Excluye paquetes Windows-especificos y retorna 1 ante fallo.
-STEP [1]: Resolver raiz de proyecto y destino de lockfile.
-STEP [2]: Ejecutar pip freeze en archivo temporal.
-STEP [3]: Filtrar entradas no pinneadas y dependencias Windows-only.
-STEP [4]: Persistir requirements_prod.txt y salir con codigo 0.
-DOC
+# @TASK: Congelar dependencias del entorno activo en requirements_prod.txt estricto.
+# @INPUT: Python/pip disponibles dentro del entorno de release local.
+# @OUTPUT: Archivo requirements_prod.txt con salida exacta de pip freeze.
+# @CONTEXT: Paso 1 del RUNBOOK_STARTUP_RC1 y RUNBOOK_DEPLOY (freeze de dependencias).
+# @SECURITY: No instala ni actualiza paquetes; solo exporta estado actual.
+# STEP 1: Resolver PROJECT_ROOT y validar comando python.
+# STEP 2: Ejecutar python -m pip freeze y persistir salida en requirements_prod.txt.
+# STEP 3: Verificar que el archivo generado no quede vacio.
 
 set -e
-trap 'exit 1' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OUTPUT_FILE="${PROJECT_ROOT}/requirements_prod.txt"
-TMP_FILE="$(mktemp)"
 
-cleanup_tmp() {
-  rm -f "${TMP_FILE}"
-}
-
-trap cleanup_tmp EXIT
-
-if [ ! -d "${PROJECT_ROOT}" ]; then
-  echo "@OUTPUT: ERROR ruta de proyecto no disponible: ${PROJECT_ROOT}"
+if [[ ! -d "${PROJECT_ROOT}" ]]; then
+  echo "[ERROR] PROJECT_ROOT invalido: ${PROJECT_ROOT}" >&2
   exit 1
 fi
 
 if ! command -v python >/dev/null 2>&1; then
-  echo "@OUTPUT: ERROR comando python no disponible"
+  echo "[ERROR] python no disponible" >&2
   exit 1
 fi
 
-python -m pip freeze > "${TMP_FILE}"
+python -m pip freeze > "${OUTPUT_FILE}"
 
-grep -E '^[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9].*$' "${TMP_FILE}" \
-  | grep -Eiv '^(pywin32|pywinpty|pypiwin32|pyreadline|pyreadline3|win10toast|windows-curses|wincertstore|comtypes|pypiwin32)==' \
-  | LC_ALL=C sort > "${OUTPUT_FILE}"
-
-if [ ! -s "${OUTPUT_FILE}" ]; then
-  echo "@OUTPUT: ERROR requirements_prod.txt quedo vacio"
+if [[ ! -s "${OUTPUT_FILE}" ]]; then
+  echo "[ERROR] requirements_prod.txt vacio" >&2
   exit 1
 fi
 
-echo "@OUTPUT: Lockfile generado en ${OUTPUT_FILE}"
+echo "[INFO] freeze_dependencies completado"
 exit 0

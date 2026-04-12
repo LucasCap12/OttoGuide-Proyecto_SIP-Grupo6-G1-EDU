@@ -1,52 +1,42 @@
 #!/usr/bin/env bash
-
-: <<'DOC'
-@TASK: Aprovisionar entorno Python productivo en Companion PC.
-@INPUT: Usuario unitree ejecutando localmente en Ubuntu target.
-@OUTPUT: Entorno virtual creado/actualizado, dependencias instaladas y scripts ejecutables.
-@CONTEXT: Paso obligatorio previo a instalar y arrancar ottoguide_mvp.service.
-@SECURITY: Falla con codigo 1 ante error de ruta, venv o instalacion de dependencias.
-STEP [1]: Cambiar al directorio /home/unitree/ottoguide/codigo_ottoguide.
-STEP [2]: Crear .venv si no existe.
-STEP [3]: Activar .venv e instalar requirements_prod.txt.
-STEP [4]: Aplicar chmod +x recursivo sobre scripts/.
-STEP [5]: Retornar codigo 0 en exito.
-DOC
+# @TASK: Aprovisionar entorno Python persistente en Companion PC para OttoGuide.
+# @INPUT: Path de despliegue en target (/opt/ottoguide o /home/unitree/ottoguide/codigo_ottoguide).
+# @OUTPUT: Entorno .venv creado si no existe, pip actualizado y requirements_prod.txt instalado.
+# @CONTEXT: Paso 3 del RUNBOOK_DEPLOY para bootstrap en host fisico Ubuntu.
+# @SECURITY: Modo fail-fast; ante cualquier error retorna Exit 1 (NO-GO).
+# STEP 1: Resolver PROJECT_ROOT en rutas permitidas de despliegue.
+# STEP 2: Crear .venv si no existe.
+# STEP 3: Actualizar pip dentro de .venv.
+# STEP 4: Instalar de forma estricta requirements_prod.txt.
 
 set -e
-trap 'exit 1' ERR
 
-PROJECT_ROOT="/home/unitree/ottoguide/codigo_ottoguide"
-VENV_DIR="${PROJECT_ROOT}/.venv"
-REQUIREMENTS_FILE="${PROJECT_ROOT}/requirements_prod.txt"
-SCRIPTS_DIR="${PROJECT_ROOT}/scripts"
-
-if [ ! -d "${PROJECT_ROOT}" ]; then
-  echo "@OUTPUT: ERROR no existe el directorio ${PROJECT_ROOT}"
+PROJECT_ROOT=""
+if [[ -d "/opt/ottoguide" ]]; then
+  PROJECT_ROOT="/opt/ottoguide"
+elif [[ -d "/home/unitree/ottoguide/codigo_ottoguide" ]]; then
+  PROJECT_ROOT="/home/unitree/ottoguide/codigo_ottoguide"
+else
+  echo "[ERROR] NO-GO bootstrap: path de despliegue no encontrado" >&2
   exit 1
 fi
 
-cd "${PROJECT_ROOT}"
+VENV_DIR="${PROJECT_ROOT}/.venv"
+REQUIREMENTS_FILE="${PROJECT_ROOT}/requirements_prod.txt"
 
-if [ ! -d "${VENV_DIR}" ]; then
+if [[ ! -f "${REQUIREMENTS_FILE}" ]]; then
+  echo "[ERROR] NO-GO bootstrap: requirements_prod.txt ausente en ${PROJECT_ROOT}" >&2
+  exit 1
+fi
+
+if [[ ! -d "${VENV_DIR}" ]]; then
   python3 -m venv "${VENV_DIR}"
 fi
 
-if [ ! -f "${REQUIREMENTS_FILE}" ]; then
-  echo "@OUTPUT: ERROR no existe ${REQUIREMENTS_FILE}"
-  exit 1
-fi
-
-if [ ! -d "${SCRIPTS_DIR}" ]; then
-  echo "@OUTPUT: ERROR no existe ${SCRIPTS_DIR}"
-  exit 1
-fi
-
+# shellcheck source=/dev/null
 source "${VENV_DIR}/bin/activate"
 python -m pip install --upgrade pip
-python -m pip install -r "${REQUIREMENTS_FILE}"
+python -m pip install --requirement "${REQUIREMENTS_FILE}"
 
-find "${SCRIPTS_DIR}" -type f -exec chmod +x {} +
-
-echo "@OUTPUT: Bootstrap target completado en ${PROJECT_ROOT}"
+echo "[INFO] GO bootstrap_target completado"
 exit 0
